@@ -1,4 +1,6 @@
 """Landing page: staff sign in, parent family code, first-run admin setup."""
+from datetime import datetime, timedelta
+
 import streamlit as st
 
 import auth
@@ -13,24 +15,35 @@ MAX_PARENT_TRIES = 10
 def _staff_login():
     with db.session() as s:
         u, msg = auth.authenticate(s, st.session_state.get("li_user", ""), st.session_state.get("li_pass", ""))
-        if u:
-            ui.sign_in(u)
-        else:
-            st.session_state["login_error"] = msg
+        uid = u.id if u else None
+    if uid:  # after commit, so the session row can reference the user
+        ui.sign_in(uid)
+    else:
+        st.session_state["login_error"] = msg
+
+
+# Family-code guessing throttle, shared across all browser sessions on this server process
+_CODE_FAILS: list[datetime] = []
+CODE_WINDOW = timedelta(minutes=10)
+CODE_MAX_FAILS = 30
 
 
 def _parent_login():
+    now = datetime.now()
+    _CODE_FAILS[:] = [t for t in _CODE_FAILS if now - t < CODE_WINDOW]
     tries = st.session_state.get("parent_tries", 0)
-    if tries >= MAX_PARENT_TRIES:
-        st.session_state["parent_error"] = "Too many attempts. Please contact the academy."
+    if tries >= MAX_PARENT_TRIES or len(_CODE_FAILS) >= CODE_MAX_FAILS:
+        st.session_state["parent_error"] = "Too many attempts. Please wait a few minutes or contact the academy."
         return
     code = (st.session_state.get("pc_code") or "").strip().upper()
     with db.session() as s:
         kids = logic.family_athletes(s, code)
     if kids:
+        if st.session_state.get("auth") or ui._cookie_token():
+            ui.sign_out()  # a parent code on a staff browser ends the staff session
         st.session_state["parent_code"] = code
-        st.session_state.pop("auth", None)
     else:
+        _CODE_FAILS.append(now)
         st.session_state["parent_tries"] = tries + 1
         st.session_state["parent_error"] = "That code wasn't recognised. Check the message from the academy."
 
@@ -42,11 +55,15 @@ def _create_admin():
         return
     try:
         with db.session() as s:
+            if auth.user_count(s):  # someone beat us to it
+                return
             u = auth.create_user(s, g("fa_user") or "admin", g("fa_name") or "Admin", "admin", g("fa_pass") or "")
             auth.audit(s, u.full_name, "admin", "user.create", u.username, "first-run admin")
-            ui.sign_in(u)
+            uid = u.id
     except ValueError as e:
         st.session_state["setup_error"] = str(e)
+        return
+    ui.sign_in(uid)
 
 
 def render():
@@ -95,7 +112,9 @@ def render():
         if cfg.get("club_phone"):
             st.caption(f"No code? WhatsApp the academy on {cfg['club_phone']}.")
 
-    if ui.demo_mode():
+    with db.session() as s:
+        show_demo = ui.demo_mode() and sample.has_sample(s)
+    if show_demo:
         with st.expander(":material/science: Demo logins (fictional data)", expanded=True):
             st.markdown(f"""
 | Who | Username | Password | What they see |

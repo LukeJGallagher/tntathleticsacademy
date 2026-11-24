@@ -12,6 +12,8 @@ DAY_ORDER = [6, 0, 1, 2, 3, 4, 5]  # Sunday first
 
 
 def _save(sid):
+    if not ui.is_admin():
+        return
     g = st.session_state.get
     k = f"sc_{sid}"
     with db.session() as s:

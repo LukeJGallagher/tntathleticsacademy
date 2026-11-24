@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
@@ -11,6 +12,7 @@ from db import AuditLog, User, utcnow
 
 _ph = PasswordHasher()
 MAX_FAILED = 5
+LOCK_FOR = timedelta(minutes=15)
 MIN_PASSWORD = 8
 
 
@@ -39,15 +41,22 @@ def authenticate(s, username: str, password: str) -> tuple[User | None, str]:
     if not u.active:
         audit(s, u.full_name, u.role, "login.failure", detail="disabled")
         return None, "This account is disabled. Ask the admin."
-    if u.failed_attempts >= MAX_FAILED:
+    now = utcnow()
+    if u.locked_until and u.locked_until > now:
+        mins = max(1, int((u.locked_until - now).total_seconds() // 60) + 1)
         audit(s, u.full_name, u.role, "login.failure", detail="locked")
-        return None, f"Account locked after {MAX_FAILED} failed attempts. Ask the admin to unlock it."
+        return None, f"Too many failed attempts. Try again in {mins} minute(s), or ask the admin to unlock it."
     if not verify_password(u.password_hash, password or ""):
         u.failed_attempts += 1
         audit(s, u.full_name, u.role, "login.failure", detail=f"attempt {u.failed_attempts}")
+        if u.failed_attempts >= MAX_FAILED:
+            u.locked_until = now + LOCK_FOR
+            u.failed_attempts = 0
+            return None, f"Too many failed attempts. Locked for {int(LOCK_FOR.total_seconds() // 60)} minutes."
         left = MAX_FAILED - u.failed_attempts
         return None, "Wrong username or password." + (f" {left} attempt(s) left." if left <= 2 else "")
     u.failed_attempts = 0
+    u.locked_until = None
     u.last_login_at = utcnow()
     audit(s, u.full_name, u.role, "login.success")
     return u, ""

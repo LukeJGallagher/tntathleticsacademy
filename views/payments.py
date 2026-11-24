@@ -95,6 +95,8 @@ def _block_preview(s, a, pay_date, sessions, per_week, stack, cfg):
 
 
 def _do_single(aid, pay_date, sessions, per_week, amount, method, stack, paid, notes, end_override):
+    if not ui.is_admin():
+        return
     with db.session() as s:
         cfg = db.get_settings(s)
         b = logic.record_payment(s, aid, pay_date, sessions, per_week, amount, method, stack, cfg,
@@ -107,6 +109,8 @@ def _do_single(aid, pay_date, sessions, per_week, amount, method, stack, paid, n
 
 
 def _do_family(items, pay_date, method, stack, paid, notes):
+    if not ui.is_admin():
+        return
     with db.session() as s:
         cfg = db.get_settings(s)
         ref, blocks = logic.record_family_payment(s, items, pay_date, method, stack, cfg, paid=paid, notes=notes)
@@ -195,6 +199,8 @@ def _record(s, athletes, cfg, d):
 # --------------------------------------------------------------------------- reminders
 
 def _mark_sent(ids, due, channel, key, by):
+    if not ui.is_admin():
+        return
     msg = st.session_state.get(key, "")
     with db.session() as s:
         for aid in ids:

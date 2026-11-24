@@ -9,7 +9,7 @@ import json
 import zipfile
 from datetime import date, datetime
 
-from sqlalchemy import delete, insert, select
+from sqlalchemy import delete, insert, select, text
 
 from db import Base
 
@@ -56,8 +56,16 @@ def restore_backup(s, data: bytes) -> dict:
         manifest = json.loads(z.read("manifest.json"))
         if manifest.get("format") != FORMAT_VERSION:
             raise ValueError("Unrecognised backup format.")
-        payload = {t.name: json.loads(z.read(f"{t.name}.json")) if f"{t.name}.json" in z.namelist() else []
+        names = set(z.namelist())
+        listed = manifest.get("tables", {})
+        missing = [t for t in listed if f"{t}.json" not in names]
+        if missing or "users" not in listed:
+            raise ValueError(f"Backup is incomplete (missing: {', '.join(missing) or 'users'}). Nothing was changed.")
+        # Tables newer than the backup (not listed) simply restore empty.
+        payload = {t.name: json.loads(z.read(f"{t.name}.json")) if t.name in listed else []
                    for t in Base.metadata.sorted_tables}
+    if not any(u.get("role") == "admin" and u.get("active") for u in payload["users"]):
+        raise ValueError("Backup has no active admin login, so restoring it would lock everyone out. Nothing was changed.")
     for table in reversed(Base.metadata.sorted_tables):
         s.execute(delete(table))
     for table in Base.metadata.sorted_tables:
@@ -66,4 +74,9 @@ def restore_backup(s, data: bytes) -> dict:
         if rows:
             s.execute(insert(table), rows)
     s.flush()
-    return manifest["tables"]
+    if s.get_bind().dialect.name == "postgresql":  # explicit ids don't advance Postgres sequences
+        for table in Base.metadata.sorted_tables:
+            if "id" in table.columns and table.c.id.autoincrement in (True, "auto") and table.c.id.primary_key:
+                s.execute(text(f"SELECT setval(pg_get_serial_sequence('{table.name}', 'id'), "
+                               f"COALESCE((SELECT MAX(id) FROM {table.name}), 0) + 1, false)"))
+    return listed

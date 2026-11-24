@@ -16,11 +16,15 @@ def _bump():
 
 
 def _save(d, sid, aid, key, by):
+    if not ui.user():
+        return
     with db.session() as s:
         logic.set_mark(s, d, sid, aid, st.session_state.get(key), by)
 
 
 def _rest(d, sid, by):
+    if not ui.user():
+        return
     with db.session() as s:
         n = logic.mark_rest_present(s, d, s.get(TrainingSession, sid), by)
     _bump()
@@ -28,6 +32,8 @@ def _rest(d, sid, by):
 
 
 def _add_makeup(d, sid, key, kind_key):
+    if not ui.user():
+        return
     aid = st.session_state.get(key)
     if not aid:
         return
@@ -57,10 +63,12 @@ def render():
                     icon=":material/event_busy:")
             return
 
-        out = logic.out_on(s, d)
+        out = logic.out_on(s, d, for_roster=True)
         ver = st.session_state.get("att_ver", 0)
-        fee_cache: dict[int, str] = {}
+        admin = ui.is_admin()
+        fee_cache: dict[int, str] = {}  # fee flags are admin-only (payment data)
         everyone = list(s.scalars(select(Athlete).where(Athlete.active.is_(True)).order_by(Athlete.first_name)))
+        st.caption("**P** Present · **L** Late · **A** Absent · **S** Sick · **E** Excused")
 
         for sess in sessions:
             r = logic.day_roster(s, sess, d)
@@ -70,24 +78,16 @@ def render():
             expected = r["attending"] + [(a, "sick") for a, _ in r["sick"]]
             done = sum(1 for a, _ in expected if a.id in marks)
             with st.container(border=True):
-                h1, h2 = st.columns([3, 1], vertical_alignment="center")
-                h1.subheader(sess.label)
-                h1.caption(f":material/schedule: {sess.start_time}–{sess.end_time}"
-                           f"{'  ·  :material/sports: ' + sess.coach.name if sess.coach else ''}"
-                           f"  ·  {len(r['attending'])}/{sess.capacity} places")
-                h2.metric("Marked", f"{done}/{len(expected)}")
-                if r["spots"] < 0:
-                    st.warning(f"Over capacity by {-r['spots']}.", icon=":material/warning:")
+                st.subheader(sess.label)
+                st.caption(f":material/schedule: {sess.start_time}–{sess.end_time}"
+                           f"{'  ·  ' + sess.coach.name if sess.coach else ''}"
+                           f"  ·  {len(r['attending'])}/{sess.capacity} places  ·  **{done}/{len(expected)} marked**")
                 if expected:
                     st.progress(done / len(expected))
-                st.button("Mark the rest present", key=f"rest_{sess.id}_{d}", icon=":material/done_all:",
-                          on_click=_rest, args=(d, sess.id, user.get("name", "")),
-                          disabled=done == len(expected), type="primary",
-                          help="Anyone on the sick list is marked Sick. Unconfirmed athletes are left for you to tap.")
+                if r["spots"] < 0:
+                    st.warning(f"Over capacity by {-r['spots']}.", icon=":material/warning:")
 
                 for a, kind in rows:
-                    if a.id not in fee_cache:
-                        fee_cache[a.id] = logic.athlete_finance(s, a, d, cfg)["status"]
                     flags = []
                     if kind == "unconfirmed":
                         flags.append(ui.badge("Unconfirmed", "gray"))
@@ -95,21 +95,30 @@ def render():
                         flags.append(ui.badge(kind.title(), "blue"))
                     if a.id in out:
                         flags.append(ui.badge(f"{out[a.id].kind}", "red"))
-                    if fee_cache[a.id] in ("due", "unpaid"):
-                        flags.append(ui.badge("Fees " + logic.FEE_LABEL[fee_cache[a.id]].lower(), "orange"))
+                    if admin:
+                        if a.id not in fee_cache:
+                            fee_cache[a.id] = logic.athlete_finance(s, a, d, cfg)["status"]
+                        if fee_cache[a.id] in ("due", "unpaid"):
+                            flags.append(ui.badge("Fees " + logic.FEE_LABEL[fee_cache[a.id]].lower(), "orange"))
                     if a.medical_notes:
                         flags.append(ui.badge("Medical", "violet"))
-                    col_a, col_b = st.columns([2, 3], vertical_alignment="center")
-                    col_a.markdown(f"**{a.name}**  {' '.join(flags)}", help=a.medical_notes or None)
-                    key = f"m_{d}_{sess.id}_{a.id}_{ver}"
-                    col_b.segmented_control(
-                        "Mark", OPTIONS, format_func=LABELS.get, key=key, default=marks.get(a.id),
-                        on_change=_save, args=(d, sess.id, a.id, key, user.get("name", "")),
-                        label_visibility="collapsed")
+                    with st.container(key=f"row_{sess.id}_{a.id}"):
+                        col_a, col_b = st.columns([2, 3], vertical_alignment="center", gap="small")
+                        col_a.markdown(f"**{a.name}**  {' '.join(flags)}", help=a.medical_notes or None)
+                        key = f"m_{d}_{sess.id}_{a.id}_{ver}"
+                        col_b.segmented_control(
+                            "Mark", OPTIONS, key=key, default=marks.get(a.id), width="stretch",
+                            on_change=_save, args=(d, sess.id, a.id, key, user.get("name", "")),
+                            label_visibility="collapsed")
 
                 if not rows:
                     st.info("No athletes confirmed for this session yet. Add them below or in Bookings.",
                             icon=":material/person_add:")
+                else:
+                    st.button("Mark the rest present", key=f"rest_{sess.id}_{d}", icon=":material/done_all:",
+                              on_click=_rest, args=(d, sess.id, user.get("name", "")), width="stretch",
+                              disabled=done == len(expected), type="primary",
+                              help="Anyone on the sick list is marked Sick. Unconfirmed athletes are left for you to tap.")
 
                 notes = []
                 if r["cancelled"]:

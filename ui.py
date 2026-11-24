@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
 import secrets
 from datetime import datetime, timedelta
 from functools import lru_cache
@@ -58,6 +59,32 @@ h1 {{ font-size: 2.6rem !important; line-height: 1.05 !important; }}
 [data-testid="stSidebar"] [data-testid="stPageLink"] a[aria-current="page"] {{ background: #17191B;
                    box-shadow: inset 3px 0 0 {BRAND['blue']}; }}
 iframe[height="0"] {{ display: none; }}
+/* Attendance / segmented controls: selected state must be obvious in sunlight */
+[data-testid="stBaseButton-segmented_controlActive"], [data-testid="stBaseButton-pillsActive"] {{
+  background: {BRAND['blue']} !important; color: #fff !important; border-color: {BRAND['blue']} !important;
+  font-weight: 700 !important; }}
+[class*="st-key-row_"] [data-testid="stButtonGroup"] {{ flex-wrap: nowrap; }}
+[class*="st-key-row_"] [data-testid="stButtonGroup"] button {{ flex: 1 1 0; min-height: 44px; min-width: 0;
+  font-weight: 700; padding: 0 !important; justify-content: center; }}
+[class*="st-key-row_"] [data-testid="stButtonGroup"] button,
+[class*="st-key-row_"] [data-testid="stButtonGroup"] button * {{ overflow: visible !important; text-overflow: clip !important; }}
+[class*="st-key-row_"] [data-testid="stButtonGroup"] button [data-testid="stMarkdownContainer"] {{ width: auto !important;
+  min-width: 1.2ch; max-width: none !important; }}
+[class*="st-key-row_"] [data-testid="stButtonGroup"] button p {{ margin: 0 !important; font-size: 1.05rem;
+  white-space: nowrap; }}
+[class*="st-key-row_"] {{ border-bottom: 1px solid #22252a; padding-bottom: .35rem; }}
+/* Brand buttons: uppercase like the website CTAs */
+button[kind="primary"], [data-testid="stBaseButton-primary"] {{ text-transform: uppercase; letter-spacing: .06em;
+  font-weight: 700; }}
+[data-testid="stMetric"] {{ min-height: 6.6rem; }}
+/* Sidebar toggle on phones: visible, thumb-sized */
+[data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapsedControl"] button {{
+  color: {BRAND['blue']} !important; transform: scale(1.35); }}
+@media (max-width: 640px) {{
+  .tnt-hero {{ flex-direction: column; align-items: flex-start; gap: .6rem; }}
+  [data-testid="stVerticalBlock"] {{ gap: .55rem; }}
+  [class*="st-key-row_"] [data-testid="stColumn"] {{ min-width: 0 !important; }}
+}}
 @media (max-width: 640px) {{
   h1 {{ font-size: 2rem !important; }}
   .tnt-hero {{ padding: 1.1rem 1.2rem; }}
@@ -123,14 +150,16 @@ def _hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def sign_in(u: User) -> None:
-    """Create a server-side session and queue the browser cookie (written by flush_cookie on the next run)."""
+def sign_in(user_id: int) -> None:
+    """Create a server-side session and queue the browser cookie. Call AFTER the transaction that
+    created/updated the user has committed (a second session can't see uncommitted rows)."""
     token = secrets.token_urlsafe(32)
     with db.session() as s:
-        s.add(StaffSession(token_hash=_hash(token), user_id=u.id, created_at=utcnow(), last_seen=utcnow()))
+        s.add(StaffSession(token_hash=_hash(token), user_id=user_id, created_at=utcnow(), last_seen=utcnow()))
+    for k in ("parent_code", "_ignore_cookie"):
+        st.session_state.pop(k, None)
     st.session_state["auth"] = {"token": token}
     st.session_state["_cookie"] = (token, int(ABSOLUTE_TIMEOUT.total_seconds()))
-    st.session_state.pop("parent_code", None)
 
 
 def sign_out(actor: str | None = None, role: str | None = None) -> None:
@@ -157,16 +186,27 @@ def _cookie_token() -> str | None:
         return None
 
 
-def flush_cookie() -> None:
-    """Write or clear the session cookie in the browser. Call once per run, early."""
+def _is_https() -> bool:
+    try:
+        return str(st.context.url or "").startswith("https://")
+    except Exception:
+        return False
+
+
+def flush_cookie() -> bool:
+    """Write or clear the session cookie in the browser. Call once per run, early. When a new session
+    cookie is written the page reloads itself, so the cookie is guaranteed to land before any navigation.
+    Returns True when a reload is pending (caller should st.stop())."""
     pending = st.session_state.pop("_cookie", None)
     if pending is None:
-        return
+        return False
     token, max_age = pending
-    secure = "; Secure" if (db.secret("COOKIE_SECURE", "1") == "1") else ""
+    secure = "; Secure" if _is_https() else ""
+    reload = "window.parent.location.reload();" if token else ""
     components.html(
-        f"<script>window.parent.document.cookie = '{COOKIE}={token}; Max-Age={max_age}; Path=/; SameSite=Lax{secure}';</script>",
-        height=0)
+        f"<script>window.parent.document.cookie = '{COOKIE}={token}; Max-Age={max_age}; Path=/; SameSite=Lax{secure}';"
+        f"{reload}</script>", height=0)
+    return bool(token)
 
 
 def current_user() -> dict | None:
@@ -203,7 +243,13 @@ def revoke_user_sessions(s, user_id: int) -> None:
 
 
 def user() -> dict:
-    return st.session_state.get("_user") or {}
+    """The signed-in staff user. Re-validated against the session store on every call, so callbacks
+    (which run before the page script) never act for a signed-out, expired or disabled user."""
+    if os.environ.get("ROLLCALL_TEST") == "1" and "_test_user" in st.session_state:
+        return st.session_state["_test_user"] or {}
+    if not st.session_state.get("auth") and not _cookie_token():
+        return {}
+    return current_user() or {}
 
 
 def is_admin() -> bool:

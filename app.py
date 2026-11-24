@@ -27,10 +27,11 @@ with db.session() as s:
 from views import (athletes, attendance, book, bookings, health, home, overview, payments, reports,  # noqa: E402
                    schedule, settings)
 
+if ui.flush_cookie():  # just signed in: cookie written, page reloads on the same URL
+    st.caption("Signing you in…")
+    st.stop()
 user = ui.current_user()
-st.session_state["_user"] = user
 role = user["role"] if user else ("parent" if st.session_state.get("parent_code") else None)
-ui.flush_cookie()
 
 ADMIN, COACH, PARENT = {"admin"}, {"admin", "coach"}, {"parent"}
 # key, render, title (admin), title (coach), icon, section, roles

@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT))
 TMP = Path(tempfile.mkdtemp()) / "smoke.db"
 os.environ["DATABASE_URL"] = f"sqlite:///{TMP.as_posix()}"
 os.environ["DEMO_MODE"] = "1"
+os.environ["ROLLCALL_TEST"] = "1"
 
 from streamlit.testing.v1 import AppTest  # noqa: E402
 
@@ -35,7 +36,7 @@ def page(module: str, user: dict | None = None, parent: str | None = None, state
         import streamlit as st
         import ui
         ui.inject_css()
-        st.session_state["_user"] = user
+        st.session_state["_test_user"] = user
         if parent:
             st.session_state["parent_code"] = parent
         for k, v in (state or {}).items():
@@ -50,7 +51,8 @@ at = AppTest.from_file("app.py", default_timeout=60).run()
 check(at, "landing (app.py)")
 at.text_input(key="li_user").input("admin")
 at.text_input(key="li_pass").input("demo1234")
-at.button[0].click().run()
+at.button[0].click().run()  # sign-in run: cookie written, page asks the browser to reload
+at.run()                     # the reload (AppTest has no browser; session_state carries the token)
 check(at, "admin sign-in → overview")
 assert any("Overview" in m.value for m in at.title), [t.value for t in at.title]
 
@@ -157,6 +159,62 @@ with db.session() as s:
     after = logic.athlete_finance(s, a, d, cfg)["next_due"]
     print(f"ok   payment stacks: next due {before} → {after}")
     assert after is None or before is None or after > before
+
+# 7. Regression tests for the Nov 2026 code audit
+import auth  # noqa: E402
+import backup  # noqa: E402
+import ui  # noqa: E402
+
+# 7.1 sign-in after creating a user in the same flow (first-run admin) must not deadlock
+with db.session() as s:
+    uid = auth.create_user(s, "owner2", "Owner Two", "admin", "longpassword1").id
+ui.sign_in(uid)
+print("ok   audit#1 sign-in after user creation")
+
+with db.session() as s:
+    cfg = db.get_settings(s)
+    d = logic.today(cfg)
+    a = s.scalar(select(db.Athlete).where(db.Athlete.programme == "Youth", db.Athlete.active.is_(True)))
+    sess = [x for x in a.sessions if x.active][0]
+    past = d - _dt.timedelta(days=(d.weekday() - sess.weekday) % 7 or 7)
+    # 7.2 a sickness cancellation never overwrites a mark the coach recorded
+    logic.set_mark(s, past, sess.id, a.id, "P", "coach")
+    logic.cancel(s, a.id, sess.id, past, reason="Sick", source="parent")
+    assert logic.marks_for(s, past, sess.id)[a.id] == "P"
+    print("ok   audit#3 cancel keeps coach's Present mark")
+    # 7.3 open-ended sickness stops removing the child from rosters after a week
+    ev = db.HealthEvent(athlete_id=a.id, kind="Illness", start_date=d - _dt.timedelta(days=10))
+    s.add(ev)
+    s.flush()
+    assert a.id in logic.out_on(s, d) and a.id not in logic.out_on(s, d, for_roster=True)
+    s.delete(ev)
+    print("ok   audit#5 open-ended sickness expires from rosters")
+    # 7.4 backup without users / without an admin is refused, data untouched
+    z = backup.make_backup(s)
+    import io, json, zipfile  # noqa: E401,E402
+    buf = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(z)) as zin, zipfile.ZipFile(buf, "w") as zout:
+        for n in zin.namelist():
+            if n == "users.json":
+                zout.writestr(n, json.dumps([]))
+            else:
+                zout.writestr(n, zin.read(n))
+    try:
+        backup.restore_backup(s, buf.getvalue())
+        raise AssertionError("restore without admin should fail")
+    except ValueError:
+        pass
+    print("ok   audit#4 restore without an admin refused")
+    # 7.5 coach can't see a one-off make-up athlete outside the ±14 day window
+    tom_cfg = dict(cfg)
+    toto = s.scalar(select(db.Athlete).where(db.Athlete.programme == "ToTs"))
+    vis_before = logic.visible_athlete_ids(s, TOM, tom_cfg)
+    s.add(db.Booking(date=d - _dt.timedelta(days=40), session_id=logic.list_sessions(s, TOM, tom_cfg)[0].id,
+                     athlete_id=toto.id, status="booked", kind="makeup"))
+    s.flush()
+    assert toto.id not in logic.visible_athlete_ids(s, TOM, tom_cfg) or toto.id in vis_before
+    print("ok   audit#2 old make-up booking doesn't grant coach visibility")
+    s.rollback()
 
 print("\nALL PASSED" if not FAIL else f"\n{len(FAIL)} FAILED: {FAIL}")
 sys.exit(1 if FAIL else 0)

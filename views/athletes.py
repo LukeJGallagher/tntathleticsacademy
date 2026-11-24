@@ -215,10 +215,14 @@ def _tab_profile(s, a, admin, cfg):
 
 def _tab_attendance(s, a, d):
     since = d - timedelta(weeks=12)
-    rows = s.execute(select(Attendance.date, TrainingSession.label, Attendance.status, Attendance.recorded_by)
-                     .join(TrainingSession, TrainingSession.id == Attendance.session_id)
-                     .where(Attendance.athlete_id == a.id, Attendance.date >= since)
-                     .order_by(Attendance.date.desc())).all()
+    q = (select(Attendance.date, TrainingSession.label, Attendance.status, Attendance.recorded_by)
+         .join(TrainingSession, TrainingSession.id == Attendance.session_id)
+         .where(Attendance.athlete_id == a.id, Attendance.date >= since)
+         .order_by(Attendance.date.desc()))
+    vis = logic.visible_session_ids(s, ui.user(), db.get_settings(s))  # coaches: their own sessions only
+    if vis is not None:
+        q = q.where(Attendance.session_id.in_(vis or {-1}))
+    rows = s.execute(q).all()
     df = pd.DataFrame([{"Date": r[0], "Session": r[1], "Status": logic.STATUS.get(r[2], r[2]), "Code": r[2],
                         "Recorded by": r[3]} for r in rows])
     if df.empty:
@@ -235,6 +239,8 @@ def _tab_attendance(s, a, d):
 
 
 def _log_health(aid, key, by):
+    if not ui.user():
+        return
     g = lambda k: st.session_state.get(f"{key}_{k}")
     with db.session() as s:
         _, n = logic.report_health(s, aid, g("kind"), g("desc") or "", g("start"), g("ret"), by=by,
@@ -266,6 +272,8 @@ def _tab_health(s, a, d, user):
 
 
 def _save_block(bid, key):
+    if not ui.is_admin():
+        return
     g = lambda k: st.session_state.get(f"{key}_{k}")
     with db.session() as s:
         b = s.get(PaymentBlock, bid)
@@ -327,6 +335,8 @@ def _tab_payments(s, a, f, cfg, d):
 
 
 def _new_code(aid):
+    if not ui.is_admin():
+        return
     with db.session() as s:
         a = s.get(Athlete, aid)
         old = a.family_code

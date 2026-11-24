@@ -10,6 +10,8 @@ from db import Reminder, utcnow
 
 
 def _contacted(aid, msg, by):
+    if not ui.user():
+        return
     with db.session() as s:
         s.add(Reminder(athlete_id=aid, channel="Follow-up (WhatsApp)", message=msg, sent_by=by, sent_on=utcnow()))
     st.toast("Logged. They'll drop off this list.", icon=":material/check:")
@@ -56,8 +58,8 @@ def render():
                        delta=f"{r_now - r_prev:+.0f} pts vs last week" if r_now is not None and r_prev is not None else None,
                        border=True)
         if admin:
-            cols[4].metric("Fees to chase", len(due_now), delta=f"{len(due_soon)} due within {soon_days} days",
-                           delta_color="off", border=True)
+            cols[4].metric("Fees to chase now", len(due_now), border=True,
+                           help=f"Due now, unpaid or no block. Another {len(due_soon)} due within {soon_days} days.")
 
         left, right = st.columns(2, gap="large")
         with left:

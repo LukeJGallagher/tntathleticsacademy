@@ -69,7 +69,12 @@ def visible_athlete_ids(s, user: dict, cfg: dict) -> set[int] | None:
     if not sids:
         return set()
     ids = set(s.scalars(select(session_athletes.c.athlete_id).where(session_athletes.c.session_id.in_(sids))))
-    ids |= set(s.scalars(select(Booking.athlete_id).where(Booking.session_id.in_(sids), Booking.status != "cancelled")))
+    # One-off bookings (make-up, trial, casual) only grant visibility around the booked date,
+    # so adding a child as a make-up doesn't hand a coach their profile indefinitely.
+    d = today(cfg)
+    ids |= set(s.scalars(select(Booking.athlete_id).where(
+        Booking.session_id.in_(sids), Booking.status.in_(["booked", "pending"]),
+        Booking.date >= d - timedelta(days=14), Booking.date <= d + timedelta(days=14))))
     return ids
 
 
@@ -116,7 +121,7 @@ def day_roster(s, sess: TrainingSession, d: date) -> dict:
     waitlist / cancelled as booked."""
     bookings = {b.athlete_id: b for b in s.scalars(
         select(Booking).where(Booking.date == d, Booking.session_id == sess.id))}
-    out = out_on(s, d)
+    out = out_on(s, d, for_roster=True)
     attending, cancelled, waitlist, sick, pending = [], [], [], [], []
     regular_ids = set()
     if d.weekday() == sess.weekday:
@@ -210,10 +215,12 @@ def cancel(s, athlete_id: int, session_id: int, d: date, reason="", source="staf
         b = Booking(date=d, session_id=session_id, athlete_id=athlete_id, created_at=utcnow(),
                     kind="regular" if _is_regular(sess, athlete_id) else "casual")
         s.add(b)
-    b.status, b.reason, b.source = "cancelled", reason, source
+    b.status, b.reason, b.source = "cancelled", (reason or "")[:200], source
     low = (reason or "").lower()
-    if any(w in low for w in ("sick", "ill", "injur")):
-        set_mark(s, d, session_id, athlete_id, "S", AUTO_SICK)
+    existing = s.scalar(select(Attendance).where(Attendance.date == d, Attendance.session_id == session_id,
+                                                 Attendance.athlete_id == athlete_id))
+    if any(w in low for w in ("sick", "ill", "injur")) and existing is None:
+        set_mark(s, d, session_id, athlete_id, "S", AUTO_SICK)  # never overwrite a mark a coach recorded
     s.flush()
     return promote_waitlist(s, session_id, d)
 
@@ -241,17 +248,25 @@ def remove_booking(s, athlete_id: int, session_id: int, d: date) -> None:
     s.flush()
 
 
-def reinstate(s, athlete_id: int, session_id: int, d: date) -> None:
+def reinstate(s, athlete_id: int, session_id: int, d: date, staff: bool = True) -> str:
+    """Undo a cancellation. Staff may overbook; a parent whose place was given away joins the waitlist."""
     sess = s.get(TrainingSession, session_id)
     b = _get_booking(s, athlete_id, session_id, d)
     if b is None:
-        return
+        return "none"
+    if not staff and b.status == "cancelled" and day_roster(s, sess, d)["spots"] <= 0:
+        if _is_regular(sess, athlete_id):
+            return "full"
+        b.status, b.reason, b.created_at = "waitlist", None, utcnow()
+        s.flush()
+        return "waitlist"
     if _is_regular(sess, athlete_id):
         s.delete(b)
     else:
         b.status, b.reason = "booked", None
     _clear_auto_sick(s, athlete_id, session_id, d)
     s.flush()
+    return "booked"
 
 
 def _clear_auto_sick(s, athlete_id, session_id, d):
@@ -315,7 +330,7 @@ def marks_for(s, d: date, session_id: int) -> dict[int, str]:
 
 def mark_rest_present(s, d: date, sess: TrainingSession, by: str) -> int:
     marks = marks_for(s, d, sess.id)
-    out = out_on(s, d)
+    out = out_on(s, d, for_roster=True)
     n = 0
     r = day_roster(s, sess, d)
     for a, _ in r["attending"] + r["sick"]:
@@ -327,40 +342,56 @@ def mark_rest_present(s, d: date, sess: TrainingSession, by: str) -> int:
 
 # --------------------------------------------------------------------------- health
 
-def out_on(s, d: date) -> dict[int, HealthEvent]:
+OPEN_ENDED_DAYS = 7  # no return date given: assume out for a week, then they reappear on lists
+
+
+def out_on(s, d: date, for_roster: bool = False) -> dict[int, HealthEvent]:
+    """Open health events on date d. The sick list shows all of them (overdue ones flagged).
+    for_roster=True drops events past their expected return, or older than a week with no return
+    date, so a forgotten entry never removes a child from sessions (or gives free sessions) forever."""
     evs = s.scalars(select(HealthEvent).where(
         HealthEvent.start_date <= d,
         or_(HealthEvent.returned_date.is_(None), HealthEvent.returned_date > d)))
-    return {e.athlete_id: e for e in evs}
+    out = {}
+    for e in evs:
+        if for_roster:
+            if e.expected_return and e.expected_return <= d:
+                continue
+            if not e.expected_return and (d - e.start_date).days >= OPEN_ENDED_DAYS:
+                continue
+        out[e.athlete_id] = e
+    return out
 
 
 def report_health(s, athlete_id: int, kind: str, description: str, start: date, expected_return: date | None,
                   by: str, notes: str = "", source="staff", cancel_sessions=True) -> tuple[HealthEvent, int]:
     """Log an illness/injury. Cancels the athlete's sessions from start until the day before
     expected return (or just the start day), marking them Sick and promoting the waitlist."""
-    ev = HealthEvent(athlete_id=athlete_id, kind=kind, description=description, start_date=start,
-                     expected_return=expected_return, notes=notes, reported_by=by)
+    ev = HealthEvent(athlete_id=athlete_id, kind=(kind or "Other")[:20], description=(description or "")[:255],
+                     start_date=start, expected_return=expected_return, notes=notes, reported_by=(by or "")[:100])
     s.add(ev)
     s.flush()
     n = 0
-    if cancel_sessions:
-        a = s.get(Athlete, athlete_id)
-        last = (expected_return - timedelta(days=1)) if expected_return and expected_return > start else start
-        last = min(last, start + timedelta(days=28))
-        d = start
-        while d <= last:
-            for sess in athlete_sessions_on(s, a, d):
+    a = s.get(Athlete, athlete_id)
+    last = (expected_return - timedelta(days=1)) if expected_return and expected_return > start else start
+    last = min(last, start + timedelta(days=28))
+    d = start
+    while d <= last:
+        for sess in athlete_sessions_on(s, a, d):
+            if cancel_sessions:
                 cancel(s, athlete_id, sess.id, d, reason=f"{HEALTH_REASON}{kind}", source=source)
                 n += 1
-            d += timedelta(days=1)
+            else:
+                promote_waitlist(s, sess.id, d)  # the sick list frees their place either way
+        d += timedelta(days=1)
     return ev, n
 
 
 def mark_returned(s, ev: HealthEvent, d: date) -> int:
-    """Back from date d: close the event and undo health cancellations from d onward."""
+    """Back from date d: close the event and undo health cancellations AFTER d (today's sick credit stays)."""
     ev.returned_date = d
     n = 0
-    for b in s.scalars(select(Booking).where(Booking.athlete_id == ev.athlete_id, Booking.date >= d,
+    for b in s.scalars(select(Booking).where(Booking.athlete_id == ev.athlete_id, Booking.date > d,
                                              Booking.status == "cancelled",
                                              Booking.reason.like(f"{HEALTH_REASON}%"))).all():
         reinstate(s, b.athlete_id, b.session_id, b.date)
@@ -413,10 +444,11 @@ def block_windows(s, a: Athlete, cfg: dict) -> list[dict]:
     deduct = cfg.get("deduct_absences") == "1"
     ext_sick = cfg.get("extend_for_sick", "1") == "1"
     ext_abs = cfg.get("extend_for_absent", "0") == "1" and not deduct
-    max_weeks = int(cfg.get("max_extension_weeks", 4) or 0)
+    max_weeks = cfg_int(cfg, "max_extension_weeks", 4)
     wd = _weekdays(a)
     blocks = sorted(a.blocks, key=lambda b: (b.start_date, b.id or 0))
     out = []
+    carry_in = 0
     for i, b in enumerate(blocks):
         nxt = blocks[i + 1].start_date if i + 1 < len(blocks) else None
         cap = nxt - timedelta(days=1) if nxt else None
@@ -427,22 +459,48 @@ def block_windows(s, a: Athlete, cfg: dict) -> list[dict]:
         credited = (c0.get("S", 0) + c0.get("E", 0) if ext_sick else 0) + (c0.get("A", 0) if ext_abs else 0)
         end = _advance_sessions(wd, manual_end, credited, b.sessions_per_week)
         end = min(end, manual_end + timedelta(weeks=max_weeks))
-        if cap:
-            end = min(end, cap)
+        carry_out = 0
+        if cap and end > cap:
+            # A prepaid block starts first: credited sessions that don't fit roll into it instead of being lost
+            fit = _sessions_between(wd, manual_end, cap, b.sessions_per_week)
+            carry_out = max(min(credited, _sessions_between(wd, manual_end, end, b.sessions_per_week)) - fit, 0)
+            end = cap
         c = _status_counts(s, a.id, b.start_date, end)
         attended = c.get("P", 0) + c.get("L", 0)
         used = attended + (c.get("A", 0) if deduct else 0)
-        purchased = b.sessions_purchased + (b.credit_sessions or 0)
+        purchased = b.sessions_purchased + (b.credit_sessions or 0) + carry_in
         out.append({"block": b, "start": b.start_date, "end": end, "base_end": b.end_date,
                     "auto_ext_days": (end - manual_end).days, "manual_ext_days": b.extend_days or 0,
-                    "credited": credited, "attended": attended, "absent": c.get("A", 0),
+                    "credited": credited, "carried_in": carry_in, "carried_out": carry_out,
+                    "attended": attended, "absent": c.get("A", 0),
                     "sick": c.get("S", 0) + c.get("E", 0), "used": used, "purchased": purchased,
                     "left": purchased - used})
+        carry_in = carry_out
     return out
 
 
+def _sessions_between(weekdays: list[int], after: date, until: date, per_week: int) -> int:
+    """Scheduled sessions in (after, until]."""
+    if until <= after:
+        return 0
+    if not weekdays:
+        return math.ceil((until - after).days / 7 * max(per_week, 1))
+    n, cur = 0, after
+    while cur < until:
+        cur += timedelta(days=1)
+        n += weekdays.count(cur.weekday())
+    return n
+
+
+def cfg_int(cfg: dict, key: str, default: int) -> int:
+    try:
+        return int(str(cfg.get(key, default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 def athlete_finance(s, a: Athlete, d: date, cfg: dict) -> dict:
-    window = int(cfg.get("due_soon_days", 7))
+    window = cfg_int(cfg, "due_soon_days", 7)
     wins = block_windows(s, a, cfg)
     started = [w for w in wins if w["start"] <= d <= w["end"]]
     cur = started[-1] if started else None
@@ -611,7 +669,7 @@ def contact_links(a: Athlete, msg: str, cfg: dict) -> dict[str, str]:
 def followups(s, athletes: list[Athlete], d: date, cfg: dict) -> list[dict]:
     """Active athletes with a weekly group who haven't attended (P/L) for followup_days,
     excluding anyone on the sick list and anyone contacted within that window."""
-    days = int(cfg.get("followup_days", 14) or 14)
+    days = cfg_int(cfg, "followup_days", 14)
     cutoff = d - timedelta(days=days)
     ids = [a.id for a in athletes]
     if not ids:

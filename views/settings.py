@@ -23,12 +23,32 @@ def _me():
     return u.get("name"), u.get("role")
 
 
+NUMERIC = {"default_sessions", "default_per_week", "default_amount", "due_soon_days", "max_extension_weeks",
+           "reminder_quiet_days", "booking_days", "cancel_cutoff_hours", "followup_days"}
+
+
 def _save_settings(keys):
+    if not ui.is_admin():
+        return
+    bad = []
+    for k in keys:
+        v = st.session_state.get(f"set_{k}")
+        if k in NUMERIC:
+            try:
+                if float(str(v).strip()) < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                bad.append(k.replace("_", " "))
+    if bad:
+        st.toast(f"Not saved: enter a number for {', '.join(bad)}.", icon=":material/error:")
+        return
     with db.session() as s:
         for k in keys:
             v = st.session_state.get(f"set_{k}")
             if isinstance(v, bool):
                 v = "1" if v else "0"
+            elif k in NUMERIC:
+                v = str(int(float(str(v).strip()))) if k != "default_amount" else str(float(str(v).strip()))
             db.set_setting(s, k, v if v is not None else "")
         auth.audit(s, *_me(), "settings.change", ",".join(keys))
     st.toast("Settings saved", icon=":material/save:")
@@ -88,6 +108,8 @@ def _rules(cfg):
 
 
 def _create_user():
+    if not ui.is_admin():
+        return
     g = st.session_state.get
     try:
         with db.session() as s:
@@ -100,6 +122,8 @@ def _create_user():
 
 
 def _user_action(uid, action):
+    if not ui.is_admin():
+        return
     me = ui.user()
     with db.session() as s:
         u = s.get(User, uid)
@@ -163,6 +187,8 @@ def _staff(s):
 
 
 def _add_coach():
+    if not ui.is_admin():
+        return
     g = st.session_state.get
     if not (g("nc_name") or "").strip():
         return
@@ -173,6 +199,8 @@ def _add_coach():
 
 
 def _toggle_coach(cid):
+    if not ui.is_admin():
+        return
     with db.session() as s:
         c = s.get(Coach, cid)
         c.active = not c.active

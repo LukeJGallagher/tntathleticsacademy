@@ -9,8 +9,16 @@ import ui
 from db import Athlete, TrainingSession
 
 
+def _owns(s, aid) -> bool:
+    """The child must still belong to the family code this browser signed in with."""
+    return aid in {k.id for k in logic.family_athletes(s, st.session_state.get("parent_code") or "")}
+
+
 def _act(action, aid, sid, d, reason=None):
     with db.session() as s:
+        if not _owns(s, aid):
+            st.toast("Please sign in again with your family code.", icon=":material/lock:")
+            return
         cfg = db.get_settings(s)
         sess = s.get(TrainingSession, sid)
         cutoff = int(cfg.get("cancel_cutoff_hours", 2))
@@ -26,18 +34,24 @@ def _act(action, aid, sid, d, reason=None):
             promoted = logic.cancel(s, aid, sid, d, reason=reason or "Other", source="parent")
             st.toast("Cancelled. Thanks for letting us know." + (" Your place went to the next family on the waitlist." if promoted else ""),
                      icon=":material/event_busy:")
-        elif action == "undo":
-            logic.remove_booking(s, aid, sid, d) if not logic._is_regular(sess, aid) else logic.reinstate(s, aid, sid, d)
+        elif action == "undo":  # leave waitlist / withdraw: just remove the booking
+            logic.remove_booking(s, aid, sid, d)
             st.toast("Done.", icon=":material/undo:")
+        elif action == "reinstate":  # "we're coming after all": only if the place is still free
+            res = logic.reinstate(s, aid, sid, d, staff=False)
+            st.toast({"booked": "Great, see you there.", "waitlist": "The session filled up: you're on the waitlist.",
+                      "full": "Sorry, the session is now full. Please message the academy."}.get(res, "Done."),
+                     icon=":material/undo:")
 
 
 def _report_sick(aid):
     g = st.session_state.get
     with db.session() as s:
         a = s.get(Athlete, aid)
-        if not a or (a.family_code or "").upper() != st.session_state.get("parent_code"):
+        if not a or not _owns(s, aid):
             return
-        _, n = logic.report_health(s, aid, g("ps_kind"), g("ps_desc") or "", g("ps_start"), g("ps_ret"),
+        start = max(g("ps_start") or logic.today(db.get_settings(s)), logic.today(db.get_settings(s)))
+        _, n = logic.report_health(s, aid, g("ps_kind"), (g("ps_desc") or "")[:200], start, g("ps_ret"),
                                    by=f"Parent ({a.guardian_name or a.last_name})", source="parent")
     st.session_state["book_flash"] = (f"Thanks. We've let the coaches know"
                                       + (f" and cancelled {n} session(s)." if n else "."))
@@ -64,11 +78,9 @@ def render():
         d0 = logic.today(cfg)
         ui.hero(cfg["club_name"], f"Bookings for the {kids[0].last_name or ''} family".replace("  ", " "),
                 photo="training.jpg")
-        top1, top2 = st.columns([4, 1], vertical_alignment="bottom")
         ids = [k.id for k in kids]
-        aid = ids[0] if len(ids) == 1 else top1.segmented_control(
-            "Child", ids, format_func={k.id: k.first_name for k in kids}.get, default=ids[0], key="book_child") or ids[0]
-        top2.button("Sign out", on_click=_sign_out, icon=":material/logout:", width="stretch")
+        aid = ids[0] if len(ids) == 1 else st.selectbox(
+            "Child", ids, format_func={k.id: k.first_name for k in kids}.get, key="book_child")
         a = s.get(Athlete, aid)
 
         if msg := st.session_state.pop("book_flash", None):
@@ -76,10 +88,12 @@ def render():
 
         f = logic.athlete_finance(s, a, d0, cfg)
         w = f["window"]
-        m = st.columns(3)
-        m[0].metric("Sessions left", w["left"] if w else "—", border=True)
-        m[1].metric("Block ends", f"{w['end']:%d %b}" if w else "—", border=True)
-        m[2].metric("Next payment", logic.fmt_date(f["next_due"]), border=True)
+        with st.container(border=True):
+            if w:
+                st.markdown(f"**{a.first_name}** · **{max(w['left'], 0)}** session(s) left · block ends "
+                            f"**{w['end']:%a %d %b}** · next payment **{logic.fmt_date(f['next_due'])}**")
+            else:
+                st.markdown(f"**{a.first_name}** · No active block yet. The academy will set one up when you pay.")
         if f["status"] in ("due", "unpaid"):
             st.warning(f"Payment {logic.FEE_LABEL[f['status']].lower()}. Please contact the academy"
                        + (f" on {cfg['club_phone']}" if cfg.get("club_phone") else "") + ".", icon=":material/payments:")
@@ -91,9 +105,10 @@ def render():
             with st.form("parent_sick", clear_on_submit=True):
                 c1, c2, c3 = st.columns(3)
                 c1.selectbox("Type", ["Illness", "Injury", "Other"], key="ps_kind")
-                c2.date_input("From", d0, min_value=d0 - timedelta(days=2), key="ps_start", format="DD/MM/YYYY")
+                c2.date_input("From", d0, min_value=d0, key="ps_start", format="DD/MM/YYYY")
                 c3.date_input("Expected back (optional)", None, min_value=d0, key="ps_ret", format="DD/MM/YYYY")
-                st.text_input("What's wrong? (optional)", key="ps_desc", placeholder="e.g. fever, sprained ankle")
+                st.text_input("What's wrong? (optional)", key="ps_desc", placeholder="e.g. fever, sprained ankle",
+                              max_chars=200)
                 st.caption("We'll cancel their sessions until the return date. Sick days never use a paid session.")
                 st.form_submit_button("Tell the academy", type="primary", on_click=_report_sick, args=(a.id,))
 
@@ -135,7 +150,7 @@ def render():
                         b2.button("Can't make it", key=f"cx_{k}", on_click=_act, args=("cancel", a.id, x.id, d, reason),
                                   width="stretch")
                     elif place == "cancelled":
-                        c2.button("Undo: we're coming", key=f"un_{k}", on_click=_act, args=("undo", a.id, x.id, d),
+                        c2.button("Undo: we're coming", key=f"un_{k}", on_click=_act, args=("reinstate", a.id, x.id, d),
                                   width="stretch")
                     elif place == "pending":
                         c2.button("Withdraw", key=f"wd_{k}", on_click=_act, args=("undo", a.id, x.id, d),
@@ -150,3 +165,4 @@ def render():
             st.caption("No sessions in the next two weeks.")
         st.caption(f"Changes close {cutoff} hours before a session. If a session is full you can join the waitlist; "
                    f"you'll be moved in automatically if a place opens.")
+        st.button("Sign out", on_click=_sign_out, icon=":material/logout:", type="tertiary")

@@ -53,6 +53,7 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255))
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     failed_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime)
     is_sample: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -280,8 +281,16 @@ def _migrate(eng) -> None:
             have = {c["name"] for c in insp.get_columns(table.name)}
             for col in table.columns:
                 if col.name not in have:
+                    q = eng.dialect.identifier_preparer.quote
                     coltype = col.type.compile(eng.dialect)
-                    conn.execute(text(f"ALTER TABLE {table.name} ADD COLUMN {col.name} {coltype}"))
+                    default = ""
+                    if col.default is not None and getattr(col.default, "is_scalar", False):
+                        v = col.default.arg
+                        if isinstance(v, bool):
+                            default = f" DEFAULT {'TRUE' if v else 'FALSE'}" if eng.dialect.name != "sqlite" else f" DEFAULT {int(v)}"
+                        elif isinstance(v, (int, float)):
+                            default = f" DEFAULT {v}"
+                    conn.execute(text(f"ALTER TABLE {q(table.name)} ADD COLUMN {q(col.name)} {coltype}{default}"))
 
 
 @contextmanager

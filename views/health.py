@@ -13,6 +13,8 @@ from db import Attendance, HealthEvent
 
 
 def _back(eid):
+    if not ui.user():
+        return
     with db.session() as s:
         ev = s.get(HealthEvent, eid)
         n = logic.mark_returned(s, ev, logic.today(db.get_settings(s)))
@@ -22,6 +24,8 @@ def _back(eid):
 
 
 def _log(by):
+    if not ui.user():
+        return
     g = st.session_state.get
     if not g("hl_ath"):
         st.toast("Pick an athlete first.")

@@ -12,6 +12,8 @@ from db import Athlete
 
 
 def _do(action, aid, sid, d, extra=None):
+    if not ui.user():
+        return
     with db.session() as s:
         if action == "cancel":
             promoted = logic.cancel(s, aid, sid, d, reason=extra or "Staff", source="staff")
@@ -31,6 +33,8 @@ def _do(action, aid, sid, d, extra=None):
 
 
 def _add(sid, d):
+    if not ui.user():
+        return
     g = st.session_state.get
     aid = g("bk_add_ath")
     if not aid:

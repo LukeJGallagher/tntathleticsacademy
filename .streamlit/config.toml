@@ -1,0 +1,29 @@
+[server]
+headless = true
+runOnSave = false
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+
+# Dark theme to match tntathleticsacademy.com: near-black, white logo, brand blue accent.
+[theme]
+base = "dark"
+primaryColor = "#2D98C6"
+backgroundColor = "#0F1011"
+secondaryBackgroundColor = "#1B1D20"
+textColor = "#F2F3F4"
+linkColor = "#4FB3DE"
+borderColor = "#2B2E33"
+baseRadius = "0.5rem"
+font = "Heebo:https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;600;700&display=swap"
+headingFont = "Bebas Neue:https://fonts.googleapis.com/css2?family=Bebas+Neue&display=swap"
+headingFontWeights = [400, 400, 400, 400, 400, 400]
+
+[theme.sidebar]
+backgroundColor = "#000000"
+secondaryBackgroundColor = "#17191B"
+textColor = "#F2F3F4"
+borderColor = "#22252A"

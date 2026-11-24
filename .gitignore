@@ -1,0 +1,16 @@
+# secrets
+.streamlit/secrets.toml
+.env
+.env.*
+
+# databases and backups hold personal and medical data
+*.db
+*.db-journal
+*.sqlite
+backups/
+*.zip
+*.sql.gz
+
+__pycache__/
+.venv/
+venv/

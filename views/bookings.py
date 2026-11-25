@@ -12,7 +12,7 @@ from db import Athlete
 
 
 def _do(action, aid, sid, d, extra=None):
-    if not ui.user():
+    if not ui.is_admin():
         return
     with db.session() as s:
         if action == "cancel":
@@ -33,7 +33,7 @@ def _do(action, aid, sid, d, extra=None):
 
 
 def _add(sid, d):
-    if not ui.user():
+    if not ui.is_admin():
         return
     g = st.session_state.get
     aid = g("bk_add_ath")
@@ -48,6 +48,7 @@ def _add(sid, d):
 
 
 def render():
+    ui.require_admin()
     user = ui.user()
     with db.session() as s:
         cfg = db.get_settings(s)
@@ -59,9 +60,9 @@ def render():
             return
         c1, c2 = st.columns([1, 3])
         d = c1.date_input("Date", d0, key="bk_date", format="DD/MM/YYYY")
-        todays = [x for x in sessions if x.weekday == d.weekday()]
+        todays = [x for x in sessions if x.runs_on(d)]
         if not todays:
-            c2.info(f"No sessions on {logic.WEEKDAYS[d.weekday()]}s.")
+            c2.info(f"No sessions on {d:%A %d %b}.")
         else:
             sid = c2.selectbox("Session", [x.id for x in todays], format_func={x.id: logic.session_title(x) for x in todays}.get,
                                key=f"bk_sess_{d}")
@@ -145,7 +146,7 @@ def render():
         for i in range(14):
             dd = d0 + timedelta(days=i)
             for x in sessions:
-                if x.weekday != dd.weekday():
+                if not x.runs_on(dd):
                     continue
                 r = logic.day_roster(s, x, dd)
                 rows.append({"Date": dd, "Day": dd.strftime("%a"), "Session": f"{x.start_time} {x.label}",

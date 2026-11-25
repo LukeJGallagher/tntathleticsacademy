@@ -120,7 +120,7 @@ def render():
         shown = 0
         for i in range(horizon + 1):
             d = d0 + timedelta(days=i)
-            todays = [x for x in sessions if x.weekday == d.weekday()
+            todays = [x for x in sessions if x.runs_on(d)
                       and (x.bookable or logic._is_regular(x, a.id) or logic.athlete_place(s, a, x, d) != "none")]
             for x in todays:
                 start = logic.session_start(x, d)

@@ -23,7 +23,7 @@ with db.session() as s:
     sample.load_sample(s, db.get_settings(s))
     admin = s.scalar(select(db.User).where(db.User.username == "admin"))
     tom = s.scalar(select(db.User).where(db.User.username == "tom"))
-    first = s.scalar(select(db.Athlete.id).where(db.Athlete.programme == "Youth"))
+    first = s.scalar(select(db.Athlete.id).where(db.Athlete.programme == "7–12 years"))
 ADMIN = {"id": admin.id, "username": "admin", "name": admin.full_name, "role": "admin", "coach_id": None}
 TOM = {"id": tom.id, "username": "tom", "name": tom.full_name, "role": "coach", "coach_id": tom.coach_id}
 
@@ -63,17 +63,20 @@ CASES = [
     ("admin", "health", ADMIN, None, {}),
     ("admin", "schedule", ADMIN, None, {}),
     ("admin", "schedule", ADMIN, None, {"sc_tab": "New session"}),
+    ("admin", "schedule", ADMIN, None, {"sc_tab": "New session", "nw_days": [3, 4], "nw_label": "Term squad"}),
     ("admin", "bookings", ADMIN, None, {"bk_date": THU}),
     *[("admin", "payments", ADMIN, None, {"pay_tab": t}) for t in
       ["Balances", "Upcoming", "Requests", "Record payment", "Reminders", "Import", "History"]],
     ("admin", "reports", ADMIN, None, {}),
+    *[("admin", "reports", ADMIN, None, {"rp_tab": t}) for t in ["Register", "By coach", "By session", "Raw log"]],
+    ("admin", "reports", ADMIN, None, {"rp_preset": "All time", "rp_who": None}),
     *[("admin", "settings", ADMIN, None, {"set_tab": t}) for t in
       ["Club", "Billing & booking rules", "Staff logins", "Coaches", "Backup", "Audit log", "Demo data"]],
+    ("admin", "settings", ADMIN, None, {"set_tab": "Lists"}),
+    ("admin", "account", ADMIN, None, {}),
+    ("coach", "account", TOM, None, {}),
     ("coach", "attendance", TOM, None, {"att_date": THU}),
-    ("coach", "overview", TOM, None, {}),
-    ("coach", "athletes", TOM, None, {}),
-    ("coach", "bookings", TOM, None, {"bk_date": THU}),
-    ("coach", "health", TOM, None, {}),
+    ("coach", "myschedule", TOM, None, {}),
     ("parent", "book", None, "DEMO01", {}),
     ("public", "home", None, None, {}),
 ]

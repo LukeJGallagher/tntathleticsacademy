@@ -49,7 +49,8 @@ def fmt_date(d: date | None) -> str:
 
 def session_title(sess: TrainingSession) -> str:
     coach = f" · {sess.coach.name}" if sess.coach else ""
-    return f"{sess.start_time}–{sess.end_time} · {sess.label}{coach}"
+    where = f" · {sess.location}" if sess.location else ""
+    return f"{sess.start_time}–{sess.end_time} · {sess.label}{coach}{where}"
 
 
 # --------------------------------------------------------------------------- scope (enforced in queries)
@@ -79,10 +80,14 @@ def visible_athlete_ids(s, user: dict, cfg: dict) -> set[int] | None:
     return ids
 
 
-def list_sessions(s, user: dict, cfg: dict, weekday: int | None = None, include_archived=False) -> list[TrainingSession]:
+def list_sessions(s, user: dict, cfg: dict, weekday: int | None = None, include_archived=False,
+                  on: date | None = None) -> list[TrainingSession]:
+    """on=date: only sessions that actually run that day (weekday + inside their term)."""
     q = select(TrainingSession)
     if not include_archived:
         q = q.where(TrainingSession.active.is_(True))
+    if on is not None:
+        weekday = on.weekday()
     if weekday is not None:
         q = q.where(TrainingSession.weekday == weekday)
     sids = visible_session_ids(s, user, cfg)
@@ -90,7 +95,38 @@ def list_sessions(s, user: dict, cfg: dict, weekday: int | None = None, include_
         if not sids:
             return []
         q = q.where(TrainingSession.id.in_(sids))
-    return list(s.scalars(q.order_by(TrainingSession.weekday, TrainingSession.start_time)))
+    rows = list(s.scalars(q.order_by(TrainingSession.weekday, TrainingSession.start_time)))
+    return [x for x in rows if x.runs_on(on)] if on is not None else rows
+
+
+def create_series(s, label: str, weekdays: list[int], start_time: str, end_time: str, coach_id, capacity: int,
+                  bookable: bool, starts_on: date, weeks: int | None, athlete_ids: list[int],
+                  programme: str | None = None, location: str | None = None) -> list[TrainingSession]:
+    """One weekly session per chosen weekday, all sharing a term (starts_on → starts_on + weeks).
+    weeks=None/0 → ongoing. Each weekday's first run is its first occurrence on/after starts_on."""
+    ends_on = starts_on + timedelta(weeks=weeks) - timedelta(days=1) if weeks else None
+    series = "S-" + "".join(secrets.choice(_CODE_CHARS) for _ in range(6)) if len(weekdays) > 1 else None
+    athletes = [s.get(Athlete, i) for i in athlete_ids]
+    out = []
+    for wd in sorted(set(weekdays)):
+        x = TrainingSession(label=label, weekday=wd, start_time=start_time, end_time=end_time, coach_id=coach_id,
+                            capacity=capacity, bookable=bookable, active=True, starts_on=starts_on, ends_on=ends_on,
+                            series=series, programme=programme, location=location)
+        x.athletes = list(athletes)
+        s.add(x)
+        out.append(x)
+    s.flush()
+    return out
+
+
+def occurrences(sess: TrainingSession, start: date | None = None, end: date | None = None) -> int:
+    """How many times a session runs between start and end (defaults: its own term)."""
+    a = start or sess.starts_on
+    b = end or sess.ends_on
+    if a is None or b is None:
+        return 0
+    first = a + timedelta(days=(sess.weekday - a.weekday()) % 7)
+    return 0 if first > b else (b - first).days // 7 + 1
 
 
 def list_athletes(s, user: dict, cfg: dict, active_only=True) -> list[Athlete]:
@@ -125,7 +161,7 @@ def day_roster(s, sess: TrainingSession, d: date) -> dict:
     out = out_on(s, d, for_roster=True)
     attending, cancelled, waitlist, sick, pending = [], [], [], [], []
     regular_ids = set()
-    if d.weekday() == sess.weekday:
+    if sess.runs_on(d):
         for a in sess.athletes:
             if not a.active:
                 continue
@@ -181,7 +217,7 @@ def book(s, athlete_id: int, session_id: int, d: date, kind="casual", source="st
          confirmed=True) -> str:
     """Returns 'booked' | 'waitlist' | 'pending' | 'already' | 'wrong_day'."""
     sess = s.get(TrainingSession, session_id)
-    if d.weekday() != sess.weekday:
+    if not sess.runs_on(d):
         return "wrong_day"
     r = day_roster(s, sess, d)
     if any(a.id == athlete_id for a, _ in r["attending"]):
@@ -279,7 +315,7 @@ def _clear_auto_sick(s, athlete_id, session_id, d):
 
 def athlete_sessions_on(s, a: Athlete, d: date) -> list[TrainingSession]:
     """Sessions this athlete is on for date d (regular group or an active booking)."""
-    out = {x.id: x for x in a.sessions if x.active and x.weekday == d.weekday()}
+    out = {x.id: x for x in a.sessions if x.active and x.runs_on(d)}
     for b in s.scalars(select(Booking).where(Booking.athlete_id == a.id, Booking.date == d,
                                              Booking.status.in_(["booked", "waitlist"]))):
         out[b.session_id] = b.session
@@ -417,11 +453,18 @@ def _status_counts(s, athlete_id: int, start: date, end: date) -> dict[str, int]
     return {k: v for k, v in rows}
 
 
-def _weekdays(a: Athlete) -> list[int]:
-    return [x.weekday for x in a.sessions if x.active]
+class _Sched(list):
+    """An athlete's weekly sessions; .on(d) = how many of them actually run on date d (respects terms)."""
+
+    def on(self, d: date) -> int:
+        return sum(1 for x in self if x.runs_on(d))
 
 
-def _advance_sessions(weekdays: list[int], after: date, n: int, per_week: int) -> date:
+def _weekdays(a: Athlete) -> _Sched:
+    return _Sched(x for x in a.sessions if x.active)
+
+
+def _advance_sessions(weekdays: _Sched, after: date, n: int, per_week: int) -> date:
     """Date of the n-th scheduled session after `after`. Falls back to whole weeks with no schedule."""
     if n <= 0:
         return after
@@ -430,7 +473,7 @@ def _advance_sessions(weekdays: list[int], after: date, n: int, per_week: int) -
     cur, left = after, n
     for _ in range(400):
         cur += timedelta(days=1)
-        left -= weekdays.count(cur.weekday())
+        left -= weekdays.on(cur)
         if left <= 0:
             return cur
     return cur
@@ -480,7 +523,7 @@ def block_windows(s, a: Athlete, cfg: dict) -> list[dict]:
     return out
 
 
-def _sessions_between(weekdays: list[int], after: date, until: date, per_week: int) -> int:
+def _sessions_between(weekdays: _Sched, after: date, until: date, per_week: int) -> int:
     """Scheduled sessions in (after, until]."""
     if until <= after:
         return 0
@@ -489,7 +532,7 @@ def _sessions_between(weekdays: list[int], after: date, until: date, per_week: i
     n, cur = 0, after
     while cur < until:
         cur += timedelta(days=1)
-        n += weekdays.count(cur.weekday())
+        n += weekdays.on(cur)
     return n
 
 
@@ -545,7 +588,7 @@ def next_payment_date(s, a: Athlete, d: date, cur: dict | None, future: list[dic
         Attendance.athlete_id == a.id, Attendance.date == d)) or 0) > 0
     cur_d = d + timedelta(days=1) if marked_today else d
     for _ in range(400):
-        n = wd.count(cur_d.weekday())
+        n = wd.on(cur_d)
         if n:
             if left <= 0:
                 return min(cur_d, period_end_next)
@@ -608,7 +651,7 @@ def balances_df(s, athletes: list[Athlete], d: date, cfg: dict) -> pd.DataFrame:
         f = athlete_finance(s, a, d, cfg)
         w = f["window"] or f["last"]
         rows.append({
-            "id": a.id, "Athlete": a.name, "Programme": a.programme or "", "Guardian": a.guardian_name or "",
+            "id": a.id, "Athlete": a.name, "Category": a.programme or "", "Guardian": a.guardian_name or "",
             "Phone": a.phone or "",
             "Status": FEE_LABEL[f["status"]], "_order": FEE_ORDER[f["status"]], "_status": f["status"],
             "Block start": w["start"] if w else None,
@@ -797,6 +840,60 @@ def attendance_df(s, start: date, end: date, session_ids: set[int] | None = None
     return df.sort_values(["Date", "Session", "Athlete"]) if not df.empty else df
 
 
+def sessions_attended(s, athletes: list[Athlete], start: date, end: date,
+                      session_ids: set[int] | None = None) -> pd.DataFrame:
+    """One row per athlete (including those with zero) for marks between start and end inclusive.
+    Attended = Present + Late. Attendance % = attended ÷ (attended + absent); sick/excused excluded."""
+    ids = [a.id for a in athletes]
+    if not ids:
+        return pd.DataFrame()
+    q = (select(Attendance.athlete_id, Attendance.status, func.count(), func.max(Attendance.date))
+         .where(Attendance.athlete_id.in_(ids), Attendance.date >= start, Attendance.date <= end)
+         .group_by(Attendance.athlete_id, Attendance.status))
+    if session_ids is not None:
+        q = q.where(Attendance.session_id.in_(session_ids or {-1}))
+    counts: dict[int, dict] = {}
+    last_in: dict[int, date] = {}
+    for aid, status, n, last in s.execute(q).all():
+        counts.setdefault(aid, {})[status] = n
+        if status in ("P", "L"):
+            last_in[aid] = max(last_in.get(aid, last), last)
+    dq = (select(Attendance.athlete_id, Attendance.date)
+          .where(Attendance.athlete_id.in_(ids), Attendance.date >= start, Attendance.date <= end,
+                 Attendance.status.in_(["P", "L"])).order_by(Attendance.date))
+    if session_ids is not None:
+        dq = dq.where(Attendance.session_id.in_(session_ids or {-1}))
+    dates_in: dict[int, list[date]] = {}
+    for aid, dd in s.execute(dq).all():
+        dates_in.setdefault(aid, []).append(dd)
+    rows = []
+    for a in athletes:
+        c = counts.get(a.id, {})
+        attended = c.get("P", 0) + c.get("L", 0)
+        absent = c.get("A", 0)
+        rows.append({
+            "Athlete": a.name, "Category": a.programme or "", "Groups": ", ".join(
+                f"{WEEKDAYS[x.weekday][:3]} {x.label}" for x in a.sessions if x.active),
+            "Attended": attended, "Present": c.get("P", 0), "Late": c.get("L", 0), "Absent": absent,
+            "Sick": c.get("S", 0), "Excused": c.get("E", 0),
+            "Attendance %": round(100 * attended / (attended + absent), 1) if attended + absent else None,
+            "Last attended": last_in.get(a.id),
+            "Dates attended": ", ".join(x.strftime("%a %d %b") for x in dates_in.get(a.id, []))})
+    return pd.DataFrame(rows).sort_values(["Attended", "Athlete"], ascending=[False, True])
+
+
+def register(df: pd.DataFrame) -> pd.DataFrame:
+    """Roll-sheet grid from attendance_df rows: athletes × dates, cell = mark code(s) that day."""
+    if df.empty:
+        return pd.DataFrame()
+    g = df.groupby(["Athlete", "Date"])["Code"].apply(lambda x: "/".join(sorted(x))).unstack("Date").fillna("")
+    g = g.reindex(sorted(g.columns), axis=1)
+    g.columns = [c.strftime("%a %d %b") for c in g.columns]
+    att = df[df["Code"].isin(["P", "L"])].groupby("Athlete").size()
+    g.insert(0, "Attended", att.reindex(g.index).fillna(0).astype(int))
+    return g.reset_index().sort_values("Athlete")
+
+
 def summarise(df: pd.DataFrame, by: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
@@ -814,6 +911,40 @@ def attendance_rate(df: pd.DataFrame) -> float | None:
     c = df["Code"].value_counts()
     denom = c.get("P", 0) + c.get("L", 0) + c.get("A", 0)
     return round(100 * (c.get("P", 0) + c.get("L", 0)) / denom, 1) if denom else None
+
+
+# --------------------------------------------------------------------------- age categories
+
+def setting_list(cfg: dict, key: str) -> list[str]:
+    """Admin-editable lists in Settings (stored one per line; commas also accepted)."""
+    raw = (cfg.get(key) or "").replace("\r", "")
+    parts = raw.split("\n") if "\n" in raw else raw.split(",")
+    return [p.strip() for p in parts if p.strip()]
+
+
+def categories(cfg: dict) -> list[str]:
+    """Athlete age categories, e.g. 3–6 years / 7–12 years / 13+ years."""
+    return setting_list(cfg, "categories")
+
+
+def _band(label: str) -> tuple[int, int] | None:
+    """'3–6 years' → (3, 6); '13+ years' → (13, 200); anything without numbers → None."""
+    nums = [int(n) for n in re.findall(r"\d+", label)]
+    if "+" in label and nums:
+        return nums[0], 200
+    if len(nums) >= 2:
+        return nums[0], nums[1]
+    return None
+
+
+def category_for_age(age: int | None, cfg: dict) -> str | None:
+    if age is None:
+        return None
+    for c in categories(cfg):
+        b = _band(c)
+        if b and b[0] <= age <= b[1]:
+            return c
+    return None
 
 
 # --------------------------------------------------------------------------- misc

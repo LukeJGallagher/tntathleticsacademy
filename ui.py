@@ -255,7 +255,8 @@ def current_user() -> dict | None:
             return None
         ss.last_seen = now
         st.session_state["auth"] = {"token": token}
-        return {"id": u.id, "username": u.username, "name": u.full_name, "role": u.role, "coach_id": u.coach_id}
+        return {"id": u.id, "username": u.username, "name": u.full_name, "role": u.role, "coach_id": u.coach_id,
+                "must_change": bool(u.must_change_password)}
 
 
 def revoke_user_sessions(s, user_id: int) -> None:

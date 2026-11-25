@@ -10,7 +10,7 @@ from db import Reminder, utcnow
 
 
 def _contacted(aid, msg, by):
-    if not ui.user():
+    if not ui.is_admin():
         return
     with db.session() as s:
         s.add(Reminder(athlete_id=aid, channel="Follow-up (WhatsApp)", message=msg, sent_by=by, sent_on=utcnow()))
@@ -18,6 +18,7 @@ def _contacted(aid, msg, by):
 
 
 def render():
+    ui.require_admin()
     user = ui.user()
     admin = ui.is_admin()
     with db.session() as s:
@@ -26,7 +27,7 @@ def render():
         ui.page_header("Overview" if admin else "My overview", d.strftime("%A %d %B %Y"), cfg)
 
         athletes = logic.list_athletes(s, user, cfg)
-        sessions = logic.list_sessions(s, user, cfg, weekday=d.weekday())
+        sessions = logic.list_sessions(s, user, cfg, on=d)
         out = logic.out_on(s, d)
         out_mine = {k: v for k, v in out.items() if k in {a.id for a in athletes}}
         vis = logic.visible_session_ids(s, user, cfg)

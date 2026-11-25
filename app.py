@@ -37,8 +37,8 @@ with db.session() as s:
     if ui.demo_mode() and auth.user_count(s) == 0 and not sample.has_sample(s):
         sample.load_sample(s, db.get_settings(s))
 
-from views import (athletes, attendance, book, bookings, health, home, overview, payments, reports,  # noqa: E402
-                   schedule, settings)
+from views import (account, athletes, attendance, book, bookings, health, home, myschedule, overview,  # noqa: E402
+                   payments, reports, schedule, settings)
 
 _tick("setup + seed check")
 user = ui.current_user()
@@ -49,15 +49,17 @@ role = user["role"] if user else ("parent" if st.session_state.get("parent_code"
 ADMIN, COACH, PARENT = {"admin"}, {"admin", "coach"}, {"parent"}
 # key, render, title (admin), title (coach), icon, section, roles
 SPEC = [
-    ("overview", overview.render, "Overview", "My overview", ":material/space_dashboard:", "Today", COACH),
+    ("overview", overview.render, "Overview", "Overview", ":material/space_dashboard:", "Today", ADMIN),
     ("attendance", attendance.render, "Attendance", "Attendance", ":material/how_to_reg:", "Today", COACH),
-    ("athletes", athletes.render, "Athletes", "My athletes", ":material/groups:", "Athletes", COACH),
-    ("health", health.render, "Sick & injured", "Sick & injured", ":material/healing:", "Athletes", COACH),
-    ("bookings", bookings.render, "Bookings", "Bookings", ":material/event_seat:", "Sessions", COACH),
+    ("myschedule", myschedule.render, "My schedule", "My schedule", ":material/calendar_month:", "Today", {"coach"}),
+    ("athletes", athletes.render, "Athletes", "Athletes", ":material/groups:", "Athletes", ADMIN),
+    ("health", health.render, "Sick & injured", "Sick & injured", ":material/healing:", "Athletes", ADMIN),
+    ("bookings", bookings.render, "Bookings", "Bookings", ":material/event_seat:", "Sessions", ADMIN),
     ("schedule", schedule.render, "Schedule", "Schedule", ":material/calendar_month:", "Sessions", ADMIN),
     ("payments", payments.render, "Payments", "Payments", ":material/payments:", "Money", ADMIN),
     ("reports", reports.render, "Reports", "Reports", ":material/insights:", "Money", ADMIN),
     ("settings", settings.render, "Settings", "Settings", ":material/settings:", "Admin", ADMIN),
+    ("account", account.render, "My account", "My account", ":material/manage_accounts:", "Account", COACH),
     ("book", book.render, "Book a session", "Book a session", ":material/event_available:", None, PARENT | {None}),
 ]
 HOME_FOR = {"admin": "overview", "coach": "attendance", "parent": "book", None: "home"}
@@ -118,6 +120,9 @@ if user:
         if ui.demo_mode():
             st.caption(":material/science: Demo mode: fictional data")
 
+if user and user.get("must_change") and nav.url_path != "account":
+    st.warning("You're using a temporary password. Please set your own now.", icon=":material/key:")
+    st.page_link(pages["account"], label="Change my password", icon=":material/arrow_forward:")
 _tick(f"nav built, running page {nav.url_path or 'home'}")
 nav.run()
 _tick("page done")

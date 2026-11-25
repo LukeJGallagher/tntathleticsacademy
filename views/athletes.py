@@ -11,7 +11,6 @@ import logic
 import ui
 from db import Athlete, Attendance, HealthEvent, PaymentBlock, TrainingSession
 
-PROGRAMMES = ["ToTs", "Youth", "Teen & Adult", "Sports Speed", "Schools", "Other"]
 GENDERS = ["Female", "Male", "Other"]
 
 
@@ -25,7 +24,8 @@ def _open_from_table():
 @st.dialog("New athlete", width="large")
 def _new_athlete_dialog():
     with db.session() as s:
-        sessions = logic.list_sessions(s, {"role": "admin"}, db.get_settings(s))
+        cfg0 = db.get_settings(s)
+        sessions = logic.list_sessions(s, {"role": "admin"}, cfg0)
         families = sorted({(a.family_code, a.guardian_name or "") for a in s.scalars(select(Athlete))
                            if a.family_code}, key=lambda x: x[1])
     with st.form("new_ath"):
@@ -35,7 +35,8 @@ def _new_athlete_dialog():
         dob = c1.date_input("Date of birth", value=None, min_value=date(1950, 1, 1), max_value=date.today(),
                             format="DD/MM/YYYY")
         gender = c2.selectbox("Gender", GENDERS, index=None)
-        programme = c1.selectbox("Programme", PROGRAMMES, index=None)
+        programme = c1.selectbox("Category", logic.categories(cfg0), index=None, placeholder="Automatic from age",
+                                 help="Leave blank to set it from the date of birth")
         events = c2.text_input("Event group", placeholder="e.g. Sprints, Long jump")
         groups = st.multiselect("Weekly sessions", [x.id for x in sessions],
                                 format_func={x.id: f"{logic.WEEKDAYS[x.weekday][:3]} {x.start_time} {x.label}" for x in sessions}.get)
@@ -64,6 +65,9 @@ def _new_athlete_dialog():
                     guardian = guardian or sib.guardian_name
                     phone = phone or sib.phone
                     email = email or sib.email
+                if not programme and dob:
+                    tmp = Athlete(first_name="", dob=dob)
+                    programme = logic.category_for_age(tmp.age(logic.today(cfg)), cfg)
                 a = Athlete(first_name=first.strip(), last_name=last.strip(), dob=dob, gender=gender,
                             programme=programme, event_group=events or None, guardian_name=guardian or None,
                             phone=phone or None, email=email or None, school=school or None,
@@ -78,6 +82,7 @@ def _new_athlete_dialog():
 
 
 def render():
+    ui.require_admin()
     user = ui.user()
     admin = ui.is_admin()
     with db.session() as s:
@@ -89,7 +94,7 @@ def render():
 
         f1, f2, f3, f4 = st.columns([3, 2, 1.2, 1.3], vertical_alignment="bottom")
         q = f1.text_input("Search", placeholder="Name, parent, school…", key="ath_q")
-        prog = f2.multiselect("Programme", PROGRAMMES, key="ath_prog", placeholder="All programmes")
+        prog = f2.multiselect("Category", logic.categories(cfg), key="ath_prog", placeholder="All categories")
         show_inactive = f3.toggle("Inactive", key="ath_inactive") if admin else False
         if admin and f4.button("New athlete", icon=":material/person_add:", type="primary", width="stretch"):
             _new_athlete_dialog()
@@ -105,7 +110,7 @@ def render():
         rows = []
         for a in athletes:
             f = logic.athlete_finance(s, a, d, cfg)
-            rows.append({"Name": a.name, "Age": a.age(d), "Programme": a.programme or "",
+            rows.append({"Name": a.name, "Age": a.age(d), "Category": a.programme or "",
                          "Events": a.event_group or "", "Parent": a.guardian_name or "", "Phone": a.phone or "",
                          "Fees": logic.FEE_LABEL[f["status"]],
                          "Health": f"{out[a.id].kind}" if a.id in out else "",
@@ -188,7 +193,9 @@ def _tab_profile(s, a, admin, cfg):
         last = c2.text_input("Last name", a.last_name)
         dob = c3.date_input("Date of birth", a.dob, min_value=date(1950, 1, 1), format="DD/MM/YYYY")
         gender = c1.selectbox("Gender", GENDERS, index=GENDERS.index(a.gender) if a.gender in GENDERS else None)
-        programme = c2.selectbox("Programme", PROGRAMMES, index=PROGRAMMES.index(a.programme) if a.programme in PROGRAMMES else None)
+        cats = logic.categories(cfg)
+        programme = c2.selectbox("Category", cats, index=cats.index(a.programme) if a.programme in cats else None,
+                                 placeholder="Automatic from age", help="Leave blank to set it from the date of birth")
         events = c3.text_input("Event group", a.event_group or "")
         school = c1.text_input("School", a.school or "")
         start = c2.date_input("Start date", a.start_date, format="DD/MM/YYYY")
@@ -204,6 +211,8 @@ def _tab_profile(s, a, admin, cfg):
         notes = st.text_area("Coach / admin notes", a.notes or "")
         if st.form_submit_button("Save profile", type="primary"):
             a.first_name, a.last_name, a.dob, a.gender = first.strip(), last.strip(), dob, gender
+            a.dob = dob
+            programme = programme or logic.category_for_age(a.age(logic.today(cfg)), cfg)
             a.programme, a.event_group, a.school, a.start_date, a.active = programme, events or None, school or None, start, active
             archived = [x for x in a.sessions if not x.active]
             a.sessions = archived + [s.get(TrainingSession, i) for i in groups]
@@ -239,7 +248,7 @@ def _tab_attendance(s, a, d):
 
 
 def _log_health(aid, key, by):
-    if not ui.user():
+    if not ui.is_admin():
         return
     g = lambda k: st.session_state.get(f"{key}_{k}")
     with db.session() as s:

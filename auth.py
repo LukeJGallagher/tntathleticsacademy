@@ -74,5 +74,38 @@ def create_user(s, username: str, full_name: str, role: str, password: str, coac
     return u
 
 
+def temp_password() -> str:
+    """Readable one-time password, e.g. tnt-K7QM4X (no 0/O/1/I)."""
+    import secrets
+    return "tnt-" + "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(6))
+
+
+def unique_username(s, name: str) -> str:
+    base = "".join(ch for ch in (name.split()[0] if name.split() else "coach").lower() if ch.isalnum()) or "coach"
+    u, n = base, 1
+    while s.scalar(select(User.id).where(func.lower(User.username) == u)):
+        n += 1
+        u = f"{base}{n}"
+    return u
+
+
+def add_coach_with_login(s, name: str, login: bool = True, role: str = "coach"):
+    """Create (or reuse) a coach profile and, optionally, a login with a temporary password.
+    Returns (coach, username or None, temp password or None)."""
+    from db import Coach
+    name = name.strip()
+    coach = s.scalar(select(Coach).where(func.lower(Coach.name) == name.lower()))
+    if coach is None:
+        coach = Coach(name=name, active=True)
+        s.add(coach)
+        s.flush()
+    if not login or s.scalar(select(User.id).where(User.coach_id == coach.id)):
+        return coach, None, None
+    pw = temp_password()
+    u = create_user(s, unique_username(s, name), name, role, pw, coach_id=coach.id)
+    u.must_change_password = True
+    return coach, u.username, pw
+
+
 def user_count(s) -> int:
     return s.scalar(select(func.count()).select_from(User)) or 0

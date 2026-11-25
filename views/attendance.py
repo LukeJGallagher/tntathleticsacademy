@@ -51,7 +51,7 @@ def render():
 
         c1, c2 = st.columns([1, 2])
         d = c1.date_input("Date", value=logic.today(cfg), key="att_date", format="DD/MM/YYYY")
-        sessions = logic.list_sessions(s, user, cfg, weekday=d.weekday())
+        sessions = logic.list_sessions(s, user, cfg, on=d)
         if ui.is_admin() and sessions:
             coaches = sorted({x.coach.name for x in sessions if x.coach})
             pick = c2.multiselect("Coach", coaches, placeholder="All coaches", key="att_coach")
@@ -59,7 +59,7 @@ def render():
                 sessions = [x for x in sessions if x.coach and x.coach.name in pick]
 
         if not sessions:
-            st.info(f"No {'of your ' if not ui.is_admin() else ''}sessions on {logic.WEEKDAYS[d.weekday()]}s.",
+            st.info(f"No {'of your ' if not ui.is_admin() else ''}sessions on {d:%A %d %b}.",
                     icon=":material/event_busy:")
             return
 

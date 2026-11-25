@@ -15,16 +15,17 @@ from db import (Athlete, Attendance, AuditLog, Booking, Coach, HealthEvent, Paym
 DEMO_PASSWORD = "demo1234"
 
 # weekday: 0=Mon ... 6=Sun. Qatar week: Sun–Thu + Saturday.
+C1, C2, C3 = "3–6 years", "7–12 years", "13+ years"  # age categories (editable in Settings)
 SESSIONS = [
-    # key, label, weekday, start, end, coach, capacity, programme
-    ("tots_sun", "ToTs (4–6)", 6, "16:00", "16:45", "Nadia", 10, "ToTs"),
-    ("youth_sun", "Youth Athletics (7–12)", 6, "17:00", "18:15", "Tom", 16, "Youth"),
-    ("teen_sun", "Teen & Adult (13+)", 6, "18:30", "20:00", "Ahmed", 18, "Teen & Adult"),
-    ("tots_tue", "ToTs (4–6)", 1, "16:00", "16:45", "Nadia", 10, "ToTs"),
-    ("youth_tue", "Youth Athletics (7–12)", 1, "17:00", "18:15", "Tom", 16, "Youth"),
-    ("teen_tue", "Teen & Adult (13+)", 1, "18:30", "20:00", "Ahmed", 18, "Teen & Adult"),
-    ("speed_thu", "Sports Speed (max 6)", 3, "17:00", "18:00", "Tom", 6, "Sports Speed"),
-    ("weekend_sat", "Saturday Squad (9+)", 5, "08:00", "09:30", "Ahmed", 20, "Teen & Adult"),
+    # key, label, weekday, start, end, coach, capacity
+    ("c1_sun", "Ages 3–6", 6, "16:00", "16:45", "Nadia", 10),
+    ("c2_sun", "Ages 7–12", 6, "17:00", "18:15", "Tom", 16),
+    ("c3_sun", "Ages 13+", 6, "18:30", "20:00", "Ahmed", 18),
+    ("c1_tue", "Ages 3–6", 1, "16:00", "16:45", "Nadia", 10),
+    ("c2_tue", "Ages 7–12", 1, "17:00", "18:15", "Tom", 16),
+    ("c3_tue", "Ages 13+", 1, "18:30", "20:00", "Ahmed", 18),
+    ("speed_thu", "Sports Speed (max 6)", 3, "17:00", "18:00", "Tom", 6),
+    ("weekend_sat", "Saturday Squad (13+)", 5, "08:00", "09:30", "Ahmed", 20),
 ]
 
 FIRST_M = ["Omar", "Yousef", "Liam", "Adam", "Hamad", "Noah", "Ali", "Ethan", "Khalid", "Lucas", "Faisal",
@@ -37,12 +38,13 @@ SCHOOLS = ["Doha College", "Qatar Academy", "ACS Doha", "Park House", "DESS", "A
            "Compass International", "Newton British"]
 EVENTS = ["Sprints", "Sprints, Long jump", "Middle distance", "Hurdles", "Throws", "High jump", "Sprints, Relay",
           "Long jump, Triple jump", "Cross country", "Multi-events"]
-ROSTER_PLAN = [  # programme, group keys, count, age range
-    ("ToTs", ["tots_sun", "tots_tue"], 10, (4, 6)),
-    ("Youth", ["youth_sun", "youth_tue"], 14, (7, 12)),
-    ("Teen & Adult", ["teen_sun", "teen_tue", "weekend_sat"], 10, (13, 17)),
-    ("Sports Speed", ["speed_thu"], 4, (10, 16)),
+ROSTER_PLAN = [  # group keys, count, age range (category comes from age)
+    (["c1_sun", "c1_tue"], 10, (3, 6)),
+    (["c2_sun", "c2_tue"], 14, (7, 12)),
+    (["c3_sun", "c3_tue", "weekend_sat"], 10, (13, 17)),
+    (["speed_thu"], 4, (10, 16)),
 ]
+FEES = {C1: 360, C2: 480, C3: 600}
 
 
 def has_sample(s) -> bool:
@@ -84,9 +86,12 @@ def load_sample(s, cfg: dict) -> None:
             auth.create_user(s, n.lower(), c.name, "coach", DEMO_PASSWORD, coach_id=c.id, is_sample=True)
 
     sess = {}
-    for key, label, wd, st_, en, coach, cap, _ in SESSIONS:
+    for key, label, wd, st_, en, coach, cap in SESSIONS:
         sess[key] = TrainingSession(label=label, weekday=wd, start_time=st_, end_time=en,
-                                    coach_id=coaches[coach].id, capacity=cap, bookable=True, is_sample=True)
+                                    coach_id=coaches[coach].id, capacity=cap, bookable=True, is_sample=True,
+                                    location="UDST",
+                                    programme="Sports Speed" if key == "speed_thu" else
+                                    "Competition squad" if key == "weekend_sat" else "Athletics")
     s.add_all(sess.values())
     s.flush()
 
@@ -97,7 +102,7 @@ def load_sample(s, cfg: dict) -> None:
     family_left = 0
     family_last = family_guardian = family_phone = None
     used_names = set()
-    for programme, keys, count, (lo, hi) in ROSTER_PLAN:
+    for keys, count, (lo, hi) in ROSTER_PLAN:
         for _ in range(count):
             if family_left <= 0:
                 family_code = fixed_codes.pop(0) if fixed_codes else "".join(rng.choice(logic._CODE_CHARS) for _ in range(6))
@@ -114,13 +119,14 @@ def load_sample(s, cfg: dict) -> None:
                     used_names.add((first, family_last))
                     break
             age = rng.randint(lo, hi)
-            dob = today - timedelta(days=365 * age + rng.randint(0, 360))
+            dob = today - timedelta(days=365 * age + rng.randint(0, 300))
+            programme = logic.category_for_age(age, cfg) or C3
             a = Athlete(
                 first_name=first, last_name=family_last, dob=dob, gender="Female" if female else "Male",
                 school=rng.choice(SCHOOLS), guardian_name=family_guardian, phone=family_phone,
                 email=f"{family_guardian.split()[0].lower()}.{family_last.lower().replace(' ', '').replace('-', '').replace(chr(39), '')}@example.com",
                 start_date=today - timedelta(days=rng.randint(30, 700)), active=True, family_code=family_code,
-                programme=programme, event_group=None if programme == "ToTs" else rng.choice(EVENTS),
+                programme=programme, event_group=None if programme == C1 else rng.choice(EVENTS),
                 emergency_contact=f"{family_guardian} · {family_phone}",
                 medical_notes=rng.choice([None] * 7 + ["Asthma – inhaler in bag", "Nut allergy (EpiPen)",
                                                        "Previous ankle sprain (R)"]),
@@ -151,7 +157,7 @@ def load_sample(s, cfg: dict) -> None:
     for i, a in enumerate(athletes):
         per_week = len(a.sessions)
         sessions = 8 if per_week <= 2 else 12
-        amount = {"ToTs": 360, "Youth": 480, "Teen & Adult": 600, "Sports Speed": 400}[a.programme]
+        amount = 400 if a.sessions and a.sessions[0].label.startswith("Sports Speed") else FEES.get(a.programme, 480)
         pattern = i % 9
         if pattern == 0:
             continue  # no block yet
@@ -172,8 +178,8 @@ def load_sample(s, cfg: dict) -> None:
     s.flush()
 
     # Health: one current illness, one overdue injury, two historic
-    youth = [a for a in athletes if a.programme == "Youth"]
-    teen = [a for a in athletes if a.programme == "Teen & Adult"]
+    youth = [a for a in athletes if any(x.label == "Ages 7–12" for x in a.sessions)]
+    teen = [a for a in athletes if any(x.label == "Ages 13+" for x in a.sessions)]
     s.add(HealthEvent(athlete_id=youth[3].id, kind="Illness", description="Flu", start_date=today - timedelta(days=2),
                       expected_return=today + timedelta(days=3), reported_by="Parent", is_sample=True))
     s.add(HealthEvent(athlete_id=teen[1].id, kind="Injury", description="Hamstring strain (L)",
@@ -196,7 +202,7 @@ def load_sample(s, cfg: dict) -> None:
     sun = next_wd(6)
     s.add(Booking(date=sat, session_id=sess["weekend_sat"].id, athlete_id=youth[0].id, status="booked",
                   kind="casual", source="parent", is_sample=True))
-    s.add(Booking(date=sun, session_id=sess["youth_sun"].id, athlete_id=youth[9].id, status="cancelled",
+    s.add(Booking(date=sun, session_id=sess["c2_sun"].id, athlete_id=youth[9].id, status="cancelled",
                   kind="regular", source="parent", reason="Family travel", is_sample=True))
     # Sports Speed: 4 regulars, capacity 6 → 2 casuals fill it, then 1 waitlist
     for k, a in enumerate([youth[1], youth[2], teen[2]]):

@@ -54,6 +54,7 @@ class User(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     failed_attempts: Mapped[int] = mapped_column(Integer, default=0)
     locked_until: Mapped[datetime | None] = mapped_column(DateTime)
+    must_change_password: Mapped[bool | None] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime)
     is_sample: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -106,10 +107,27 @@ class TrainingSession(Base):
     capacity: Mapped[int] = mapped_column(Integer, default=12)
     bookable: Mapped[bool] = mapped_column(Boolean, default=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    programme: Mapped[str | None] = mapped_column(String(60))  # from Settings → Lists
+    location: Mapped[str | None] = mapped_column(String(100))  # from Settings → Lists
+    starts_on: Mapped[date | None] = mapped_column(Date)  # first date it runs (None = always has)
+    ends_on: Mapped[date | None] = mapped_column(Date)  # last date it runs (None = ongoing)
+    series: Mapped[str | None] = mapped_column(String(20), index=True)  # sessions created together (multi-day term)
     is_sample: Mapped[bool] = mapped_column(Boolean, default=False)
 
     coach: Mapped[Coach | None] = relationship()
     athletes: Mapped[list[Athlete]] = relationship(secondary=session_athletes, back_populates="sessions")
+
+    def runs_on(self, d: date) -> bool:
+        """True if this weekly session takes place on date d (right weekday, inside its term)."""
+        return (d.weekday() == self.weekday and (self.starts_on is None or d >= self.starts_on)
+                and (self.ends_on is None or d <= self.ends_on))
+
+    def term_label(self) -> str:
+        if not self.starts_on and not self.ends_on:
+            return "Ongoing"
+        a = self.starts_on.strftime("%d %b") if self.starts_on else "…"
+        b = self.ends_on.strftime("%d %b %Y") if self.ends_on else "ongoing"
+        return f"{a} – {b}"
 
 
 class Attendance(Base):
@@ -351,6 +369,9 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "timezone": "Asia/Qatar",
     "club_phone": "+974 5529 7579",
     "app_url": "",
+    "categories": "3–6 years\n7–12 years\n13+ years",
+    "programmes": "Athletics\nSports Speed\nSchools (ECA/ASA)\nCompetition squad",
+    "locations": "UDST",
     "reminder_template": (
         "Hi {guardian}, a quick note from {club}: {athlete}'s current block "
         "{status_text}. Next payment date: {due_date}. Sessions left: {left}. "

@@ -64,14 +64,14 @@ assert any("Wrong username" in e.value for e in bad.error), "bad password should
 print("ok   wrong password rejected")
 
 import db  # noqa: E402
-from sqlalchemy import select  # noqa: E402
+from sqlalchemy import func, select  # noqa: E402
 
 with db.session() as s:
     admin = s.scalar(select(db.User).where(db.User.username == "admin"))
     tom = s.scalar(select(db.User).where(db.User.username == "tom"))
     ADMIN = {"id": admin.id, "username": "admin", "name": admin.full_name, "role": "admin", "coach_id": None}
     TOM = {"id": tom.id, "username": "tom", "name": tom.full_name, "role": "coach", "coach_id": tom.coach_id}
-    first_ath = s.scalar(select(db.Athlete.id).where(db.Athlete.programme == "Youth"))
+    first_ath = s.scalar(select(db.Athlete.id).where(db.Athlete.programme == "7–12 years"))
 
 # 2. Every page, admin
 for mod in ["overview", "attendance", "athletes", "health", "schedule", "bookings", "payments", "reports", "settings"]:
@@ -88,12 +88,13 @@ for tab in ["Record payment", "Reminders", "History"]:
     check(at, f"admin · payments/{tab}")
 
 # 3. Coach pages + scope
-for mod in ["attendance", "overview", "athletes", "bookings", "health"]:
+for mod in ["attendance", "myschedule", "account"]:
     at = page(mod, TOM).run()
     check(at, f"coach · {mod}")
-at = page("payments", TOM).run()
-assert at.error and "Only the admin" in at.error[0].value, "coach must be blocked from payments"
-print("ok   coach blocked from payments")
+for mod in ["payments", "overview", "athletes", "bookings", "health", "schedule", "reports", "settings"]:
+    at = page(mod, TOM).run()
+    assert at.error and "Only the admin" in at.error[0].value, f"coach must be blocked from {mod}"
+print("ok   coach blocked from payments, overview, athletes, bookings, health, schedule, reports, settings")
 
 # 4. Attendance: mark, re-render shows it, "mark the rest" fills the roster
 # (AppTest can't drive a segmented control while others are unset, so marks go through the callback's function.)
@@ -130,7 +131,7 @@ import datetime as _dt  # noqa: E402
 with db.session() as s:
     cfg = db.get_settings(s)
     d = logic.today(cfg)
-    sess = [x for x in logic.list_sessions(s, ADMIN, cfg) if "Youth" in x.label][0]
+    sess = [x for x in logic.list_sessions(s, ADMIN, cfg) if "Ages 7–12" in x.label][0]
     nd = d + _dt.timedelta(days=(sess.weekday - d.weekday()) % 7 or 7)
     r0 = logic.day_roster(s, sess, nd)
     victim = r0["attending"][0][0]
@@ -139,7 +140,7 @@ with db.session() as s:
     s.flush()
     r1 = logic.day_roster(s, sess, nd)
     assert victim.id in {a.id for a, _ in r1["sick"]} and r1["spots"] == r0["spots"] + 1
-    outsider = s.scalar(select(db.Athlete).where(db.Athlete.programme == "ToTs"))
+    outsider = s.scalar(select(db.Athlete).where(db.Athlete.programme == "3–6 years"))
     assert logic.book(s, outsider.id, sess.id, nd, kind="trial", confirmed=False) == "pending"
     r2 = logic.day_roster(s, sess, nd)
     assert r2["spots"] == r1["spots"] and outsider.id in {a.id for a, _ in r2["pending"]}
@@ -174,6 +175,69 @@ with db.session() as s:
     assert logic.settle_request(s, req, d, "Cash", cfg) == []  # idempotent
     print(f"ok   payment request {req.reference}: {len(blocks)} blocks, {len(ups)} families upcoming")
 
+# 6c. Repeating sessions: Thu + Fri for 20 weeks
+with db.session() as s:
+    cfg = db.get_settings(s)
+    d = logic.today(cfg)
+    start = d + _dt.timedelta(days=(3 - d.weekday()) % 7 or 7)  # next Thursday
+    kid = s.scalar(select(db.Athlete).where(db.Athlete.programme == "7–12 years"))
+    made = logic.create_series(s, "Term sprint squad", [3, 4], "17:00", "18:00", None, 10, True, start, 20, [kid.id])
+    assert len(made) == 2 and made[0].series and made[0].series == made[1].series
+    assert sum(logic.occurrences(x) for x in made) == 40, [logic.occurrences(x) for x in made]
+    thu, fri = sorted(made, key=lambda x: x.weekday)
+    assert thu.runs_on(start) and not thu.runs_on(start - _dt.timedelta(days=7))
+    last_thu = start + _dt.timedelta(weeks=19)
+    assert thu.runs_on(last_thu) and not thu.runs_on(last_thu + _dt.timedelta(days=7))
+    assert thu.id in {x.id for x in logic.list_sessions(s, ADMIN, cfg, on=start)}
+    assert thu.id not in {x.id for x in logic.list_sessions(s, ADMIN, cfg, on=last_thu + _dt.timedelta(days=7))}
+    assert kid.id in {a.id for a, _ in logic.day_roster(s, thu, start)["attending"]}
+    assert logic.day_roster(s, thu, last_thu + _dt.timedelta(days=7))["attending"] == []
+    other = s.scalar(select(db.Athlete).where(db.Athlete.programme == "3–6 years"))
+    assert logic.book(s, other.id, thu.id, start - _dt.timedelta(days=7)) == "wrong_day"
+    print("ok   Thu+Fri × 20 weeks = 40 dates; nothing outside the term")
+    s.rollback()
+
+# 6d. Sessions-attended report between two dates matches a direct count, includes zero-attendance athletes
+with db.session() as s:
+    cfg = db.get_settings(s)
+    d = logic.today(cfg)
+    a0, a1 = d - _dt.timedelta(days=28), d - _dt.timedelta(days=8)
+    athletes = logic.list_athletes(s, ADMIN, cfg)
+    rep = logic.sessions_attended(s, athletes, a0, a1)
+    direct = s.scalar(select(func.count()).select_from(db.Attendance).where(
+        db.Attendance.date >= a0, db.Attendance.date <= a1, db.Attendance.status.in_(["P", "L"]),
+        db.Attendance.athlete_id.in_([a.id for a in athletes])))
+    assert len(rep) == len(athletes) and int(rep["Attended"].sum()) == direct, (int(rep["Attended"].sum()), direct)
+    print(f"ok   sessions-attended report {a0}→{a1}: {direct} sessions across {len(rep)} athletes")
+    log = logic.attendance_df(s, a0, a1)
+    grid = logic.register(log)
+    assert int(grid["Attended"].sum()) == int(log["Code"].isin(["P", "L"]).sum())
+    one = rep.iloc[0]
+    assert len([x for x in one["Dates attended"].split(", ") if x]) == one["Attended"]
+    who = one["Athlete"]
+print("ok   register grid and per-athlete dates agree with the counts")
+
+# 6e. Age categories, athlete PDF, coach password change
+cfg = {"categories": "3–6 years\n7–12 years\n13+ years"}
+assert [logic.category_for_age(x, cfg) for x in (3, 6, 7, 12, 13, 40, 2)] == \
+    ["3–6 years", "3–6 years", "7–12 years", "7–12 years", "13+ years", "13+ years", None]
+import pdfs  # noqa: E402
+with db.session() as s:
+    c2 = db.get_settings(s)
+    log = logic.attendance_df(s, d - _dt.timedelta(days=42), d)
+    who = log["Athlete"].iloc[0]
+    pdf = pdfs.athlete_statement(c2["club_name"], who, "7–12 years", d - _dt.timedelta(days=42), d,
+                                 log[log["Athlete"] == who][["Date", "Session", "Status", "Recorded by"]].to_dict("records"))
+assert pdf[:4] == b"%PDF" and len(pdf) > 3000
+if os.environ.get("SMOKE_PDF_OUT"):
+    Path(os.environ["SMOKE_PDF_OUT"]).write_bytes(pdf)
+print(f"ok   categories by age; PDF statement for {who} ({len(pdf) // 1024} KB)")
+at = page("account", TOM, state={"acc_current": "demo1234", "acc_new": "newpass123", "acc_again": "newpass123"}).run()
+check(at, "coach · my account")
+for st_ in ({"rp_tab": "Register"}, {"rp_who": who}):
+    at = page("reports", ADMIN, state=st_).run()
+    check(at, f"admin · reports {st_}")
+
 # 7. Regression tests for the Nov 2026 code audit
 import auth  # noqa: E402
 import backup  # noqa: E402
@@ -188,7 +252,7 @@ print("ok   audit#1 sign-in after user creation")
 with db.session() as s:
     cfg = db.get_settings(s)
     d = logic.today(cfg)
-    a = s.scalar(select(db.Athlete).where(db.Athlete.programme == "Youth", db.Athlete.active.is_(True)))
+    a = s.scalar(select(db.Athlete).where(db.Athlete.programme == "7–12 years", db.Athlete.active.is_(True)))
     sess = [x for x in a.sessions if x.active][0]
     past = d - _dt.timedelta(days=(d.weekday() - sess.weekday) % 7 or 7)
     # 7.2 a sickness cancellation never overwrites a mark the coach recorded
@@ -221,7 +285,7 @@ with db.session() as s:
     print("ok   audit#4 restore without an admin refused")
     # 7.5 coach can't see a one-off make-up athlete outside the ±14 day window
     tom_cfg = dict(cfg)
-    toto = s.scalar(select(db.Athlete).where(db.Athlete.programme == "ToTs"))
+    toto = s.scalar(select(db.Athlete).where(db.Athlete.programme == "3–6 years"))
     vis_before = logic.visible_athlete_ids(s, TOM, tom_cfg)
     s.add(db.Booking(date=d - _dt.timedelta(days=40), session_id=logic.list_sessions(s, TOM, tom_cfg)[0].id,
                      athlete_id=toto.id, status="booked", kind="makeup"))

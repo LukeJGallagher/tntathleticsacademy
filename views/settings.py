@@ -11,7 +11,7 @@ import db
 import logic
 import sample
 import ui
-from db import AuditLog, Coach, User
+from db import Athlete, AuditLog, Coach, User
 
 GENERAL = [("club_name", "Club name"), ("club_tagline", "Tagline"), ("venue", "Venue"), ("club_phone", "Club phone"),
            ("app_url", "App web address (for links sent to parents)"), ("currency", "Currency"),
@@ -59,7 +59,8 @@ def render():
     with db.session() as s:
         cfg = db.get_settings(s)
         ui.page_header("Settings", None, cfg)
-        sections = {"Club": lambda: _general(cfg), "Billing & booking rules": lambda: _rules(cfg),
+        sections = {"Club": lambda: _general(cfg), "Lists": lambda: _lists(cfg),
+                    "Billing & booking rules": lambda: _rules(cfg),
                     "Staff logins": lambda: _staff(s), "Coaches": lambda: _coaches(s), "Backup": lambda: _backup(s),
                     "Audit log": lambda: _audit(s), "Demo data": lambda: _demo(s, cfg)}
         sections[ui.tabs(list(sections), key="set_tab")]()
@@ -76,6 +77,39 @@ def _general(cfg):
                      help="Placeholders: {guardian} {athlete} {club} {last_seen}")
         st.form_submit_button("Save", type="primary", on_click=_save_settings,
                               args=([k for k, _ in GENERAL] + ["reminder_template", "followup_template"],))
+
+
+def _recategorise():
+    if not ui.is_admin():
+        return
+    with db.session() as s:
+        cfg = db.get_settings(s)
+        d = logic.today(cfg)
+        n = 0
+        for a in s.scalars(select(Athlete).where(Athlete.active.is_(True), Athlete.dob.is_not(None))):
+            cat = logic.category_for_age(a.age(d), cfg)
+            if cat and cat != a.programme:
+                a.programme = cat
+                n += 1
+        auth.audit(s, *_me(), "athletes.recategorise", f"{n} changed")
+    st.toast(f"{n} athlete(s) moved to their age category.", icon=":material/check:")
+
+
+def _lists(cfg):
+    st.caption("One item per line. These fill the drop-downs for athletes and sessions.")
+    with st.form("set_lists"):
+        c = st.columns(3)
+        c[0].text_area("Athlete categories (age bands)", "\n".join(logic.categories(cfg)), key="set_categories",
+                       height=180, help="Write bands like '3–6 years' or '13+ years' so the app can file athletes "
+                                        "by age automatically.")
+        c[1].text_area("Programmes", "\n".join(logic.setting_list(cfg, "programmes")), key="set_programmes",
+                       height=180, help="What a session is, e.g. Athletics, Sports Speed, Schools (ECA/ASA)")
+        c[2].text_area("Locations", "\n".join(logic.setting_list(cfg, "locations")), key="set_locations",
+                       height=180, help="Venues, e.g. UDST and partner locations")
+        st.form_submit_button("Save lists", type="primary", on_click=_save_settings,
+                              args=(["categories", "programmes", "locations"],))
+    st.button("Re-file all athletes into their age category", on_click=_recategorise, icon=":material/cake:",
+              help="Uses each athlete's date of birth and today's date. Athletes without a date of birth are left as they are.")
 
 
 def _rules(cfg):
@@ -149,6 +183,7 @@ def _user_action(uid, action):
                 return
             u.password_hash = auth.hash_password(pw)
             u.failed_attempts = 0
+            u.must_change_password = u.id != me.get("id")
             if u.id != me.get("id"):
                 ui.revoke_user_sessions(s, u.id)
             auth.audit(s, *_me(), "user.password_reset", u.username)
@@ -207,18 +242,58 @@ def _toggle_coach(cid):
         auth.audit(s, *_me(), "coach.toggle", c.name)
 
 
+def _bulk_coaches():
+    if not ui.is_admin():
+        return
+    names = [n.strip() for n in (st.session_state.get("bc_names") or "").replace(",", "\n").split("\n") if n.strip()]
+    made = []
+    with db.session() as s:
+        for n in names:
+            coach, username, pw = auth.add_coach_with_login(s, n, login=st.session_state.get("bc_login", True))
+            made.append({"Coach": coach.name, "Username": username or "(already has a login)" if st.session_state.get("bc_login", True) else "—",
+                         "Temporary password": pw or ""})
+        auth.audit(s, *_me(), "coach.bulk_create", f"{len(made)} coaches")
+    st.session_state["bc_made"] = made
+
+
 def _coaches(s):
+    cfg = db.get_settings(s)
+    if made := st.session_state.get("bc_made"):
+        with st.container(border=True):
+            st.success("Coaches added. Send each coach their login now. **Passwords are only shown here once.**",
+                       icon=":material/key:")
+            st.dataframe(made, hide_index=True, width="stretch")
+            url = (cfg.get("app_url") or "").rstrip("/")
+            for m in made:
+                if m["Temporary password"]:
+                    st.code(f"Hi {m['Coach'].split()[0]}, your {cfg['club_name']} coach login:\n"
+                            f"{url or '<app web address>'}\nUsername: {m['Username']}\n"
+                            f"Temporary password: {m['Temporary password']}\n"
+                            f"Please change it under My account after you sign in.", language=None)
+            if st.button("Done, hide passwords", icon=":material/visibility_off:"):
+                st.session_state.pop("bc_made", None)
+                st.rerun()
     coaches = logic.list_coaches(s, active_only=False)
+    logins = {u.coach_id: u.username for u in s.scalars(select(User).where(User.coach_id.is_not(None)))}
     for c in coaches:
         a, b = st.columns([4, 1], vertical_alignment="center")
-        a.markdown(f"**{c.name}** · {c.phone or ''} {c.email or ''} {'' if c.active else ui.badge('Inactive', 'gray')}")
+        a.markdown(f"**{c.name}** · " + (f"login `{logins[c.id]}`" if c.id in logins else ui.badge("No login", "gray"))
+                   + f" {c.phone or ''} {c.email or ''} {'' if c.active else ui.badge('Inactive', 'gray')}")
         b.button("Deactivate" if c.active else "Reactivate", key=f"tc_{c.id}", on_click=_toggle_coach, args=(c.id,), width="stretch")
-    with st.form("nc", clear_on_submit=True):
-        c = st.columns(3)
-        c[0].text_input("Name", key="nc_name", placeholder="Coach Sam")
-        c[1].text_input("Phone", key="nc_phone")
-        c[2].text_input("Email", key="nc_email")
-        st.form_submit_button("Add coach", on_click=_add_coach)
+    with st.container(border=True):
+        st.markdown("**Add coaches**: one name per line")
+        with st.form("bc", clear_on_submit=True):
+            st.text_area("Coach names", key="bc_names", height=140, label_visibility="collapsed",
+                         placeholder="Hossam\nMike\nOussema")
+            st.checkbox("Create a login for each (temporary password, changed on first sign-in)", True, key="bc_login")
+            st.form_submit_button("Add coaches", type="primary", on_click=_bulk_coaches)
+    with st.expander("Add one coach with phone and email"):
+        with st.form("nc", clear_on_submit=True):
+            c = st.columns(3)
+            c[0].text_input("Name", key="nc_name", placeholder="Coach Sam")
+            c[1].text_input("Phone", key="nc_phone")
+            c[2].text_input("Email", key="nc_email")
+            st.form_submit_button("Add coach", on_click=_add_coach)
 
 
 def _backup(s):

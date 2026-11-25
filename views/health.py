@@ -13,7 +13,7 @@ from db import Attendance, HealthEvent
 
 
 def _back(eid):
-    if not ui.user():
+    if not ui.is_admin():
         return
     with db.session() as s:
         ev = s.get(HealthEvent, eid)
@@ -24,7 +24,7 @@ def _back(eid):
 
 
 def _log(by):
-    if not ui.user():
+    if not ui.is_admin():
         return
     g = st.session_state.get
     if not g("hl_ath"):
@@ -38,6 +38,7 @@ def _log(by):
 
 
 def render():
+    ui.require_admin()
     user = ui.user()
     with db.session() as s:
         cfg = db.get_settings(s)

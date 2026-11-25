@@ -106,10 +106,11 @@ def render():
                         col_a, col_b = st.columns([2, 3], vertical_alignment="center", gap="small")
                         col_a.markdown(f"**{a.name}**  {' '.join(flags)}", help=a.medical_notes or None)
                         key = f"m_{d}_{sess.id}_{a.id}_{ver}"
-                        col_b.segmented_control(
-                            "Mark", OPTIONS, key=key, default=marks.get(a.id), width="stretch",
-                            on_change=_save, args=(d, sess.id, a.id, key, user.get("name", "")),
-                            label_visibility="collapsed")
+                        with col_b:
+                            ui.segmented(
+                                "Mark", OPTIONS, key=key, default=marks.get(a.id), width="stretch",
+                                on_change=_save, args=(d, sess.id, a.id, key, user.get("name", "")),
+                                label_visibility="collapsed")
 
                 if not rows:
                     st.info("No athletes confirmed for this session yet. Add them below or in Bookings.",

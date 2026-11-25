@@ -1,4 +1,5 @@
 """Payments (admin): balances, record single or family payments, WhatsApp reminders, history."""
+import json
 from collections import defaultdict
 from datetime import timedelta
 
@@ -8,9 +9,10 @@ from sqlalchemy import select
 
 import auth
 import db
+import gateway
 import logic
 import ui
-from db import Athlete, PaymentBlock, Reminder, utcnow
+from db import Athlete, PaymentBlock, PaymentRequest, Reminder, utcnow
 
 METHODS = ["Cash", "Card", "Bank transfer", "Online", "Other"]
 
@@ -22,8 +24,15 @@ def render():
         d = logic.today(cfg)
         ui.page_header("Payments", "Who's paid, who's due and when. Reminders go out by WhatsApp in one tap.", cfg)
         athletes = logic.list_athletes(s, ui.user(), cfg)
-        tab = ui.tabs(["Balances", "Record payment", "Reminders", "History"], key="pay_tab")
-        if tab == "Record payment":
+        tab = ui.tabs(["Balances", "Upcoming", "Requests", "Record payment", "Reminders", "Import", "History"],
+                      key="pay_tab")
+        if tab == "Upcoming":
+            _upcoming(s, athletes, cfg, d)
+        elif tab == "Requests":
+            _requests(s, cfg, d)
+        elif tab == "Import":
+            _import(s, cfg, d)
+        elif tab == "Record payment":
             _record(s, athletes, cfg, d)
         elif tab == "Reminders":
             _reminders(s, athletes, cfg, d)
@@ -123,8 +132,8 @@ def _do_family(items, pay_date, method, stack, paid, notes):
 def _record(s, athletes, cfg, d):
     if msg := st.session_state.pop("pay_flash", None):
         st.success(msg, icon=":material/check_circle:")
-    mode = st.segmented_control("Payment for", ["One athlete", "A family (one payment)"], default="One athlete",
-                                key="rec_mode")
+    mode = ui.segmented("Payment for", ["One athlete", "A family (one payment)"], default="One athlete",
+                        key="rec_mode")
     by_id = {a.id: a for a in athletes}
     c = st.columns(3)
     pay_date = c[0].date_input("Payment date", d, key="rec_date", format="DD/MM/YYYY")
@@ -239,7 +248,13 @@ def _reminders(s, athletes, cfg, d):
             h2.caption(f"Next payment **{logic.fmt_date(due)}**")
             tkey = f"rem_txt_{key_}"
             if tkey not in st.session_state:
-                st.session_state[tkey] = logic.family_reminder_text(kids, cfg)
+                text = logic.family_reminder_text(kids, cfg)
+                req = logic.open_request(s, lead.family_code, None if lead.family_code else lead.id)
+                if req and req.pay_url:
+                    text += f"\nPay online ({ui.money(req.amount, cfg)}): {req.pay_url}"
+                elif req:
+                    text += f"\nPayment reference: {req.reference} ({ui.money(req.amount, cfg)})"
+                st.session_state[tkey] = text
             msg = st.text_area("Message", key=tkey, height=110, label_visibility="collapsed")
             links = logic.contact_links(lead, msg, cfg)
             b = st.columns(4)
@@ -253,6 +268,238 @@ def _reminders(s, athletes, cfg, d):
                 b[0].caption("No phone or email on file")
             b[3].button("Mark sent", key=f"rem_sent_{key_}", icon=":material/check:", width="stretch",
                         on_click=_mark_sent, args=([a.id for a, _ in kids], due, "WhatsApp", tkey, ui.user().get("name")))
+
+
+# --------------------------------------------------------------------------- upcoming / requests / import
+
+def _make_request(aids, due, key):
+    if not ui.is_admin():
+        return
+    with db.session() as s:
+        cfg = db.get_settings(s)
+        kids = []
+        for aid in aids:
+            a = s.get(Athlete, aid)
+            item = logic.expected_item(a, cfg)
+            item["amount"] = float(st.session_state.get(f"{key}_amt_{aid}", item["amount"]))
+            kids.append((a, item))
+        req = logic.create_request(s, kids, due, cfg, ui.user().get("name"))
+        auth.audit(s, ui.user().get("name"), "admin", "payreq.create", req.reference, {"amount": req.amount})
+        if gateway.is_configured():
+            try:
+                lead = kids[0][0]
+                first, _, last = (lead.guardian_name or lead.name).partition(" ")
+                req.provider_id, req.pay_url = gateway.create_pay_link(
+                    req.reference, req.amount, first, last, logic.intl_phone(lead.phone, cfg["country_code"]),
+                    lead.email or "", f"{cfg['club_name']} sessions")
+                req.provider = "skipcash"
+            except Exception as e:  # request still exists; admin can retry the link or take payment manually
+                st.session_state["pay_flash_err"] = f"Request {req.reference} created, but the pay link failed: {e}"
+        ref = req.reference
+    st.toast(f"Request {ref} created", icon=":material/request_quote:")
+
+
+def _upcoming(s, athletes, cfg, d):
+    c1, c2 = st.columns([2, 3], vertical_alignment="bottom")
+    days = c1.segmented_control("Window", [30, 60, 90], default=30, key="up_days",
+                                format_func=lambda x: f"Next {x} days") if not ui.TEST_MODE else 30
+    days = days or 30
+    rows = logic.upcoming(s, athletes, d, cfg, days)
+    total = sum(r["amount"] for r in rows)
+    overdue = sum(r["amount"] for r in rows if r["overdue"])
+    m = st.columns(3)
+    m[0].metric("Expected income", ui.money(total, cfg), border=True, help="Based on each athlete's last block")
+    m[1].metric("Overdue now", ui.money(overdue, cfg), border=True)
+    m[2].metric("Families", len(rows), border=True)
+    if not rows:
+        st.success("Nothing due in this window.", icon=":material/celebration:")
+        return
+    # weekly forecast table
+    wk = pd.DataFrame([{"Week of": (r["due"] - timedelta(days=(r["due"].weekday() + 1) % 7)) if not r["overdue"] else d,
+                        "Amount": r["amount"]} for r in rows]).groupby("Week of", as_index=False).sum()
+    with st.expander("Weekly forecast", icon=":material/calendar_view_week:"):
+        st.dataframe(wk, hide_index=True, width="stretch",
+                     column_config={"Week of": st.column_config.DateColumn(format="ddd DD MMM"),
+                                    "Amount": st.column_config.NumberColumn(format=f"{cfg['currency']} %.0f")})
+        st.download_button("Download CSV", pd.DataFrame([{
+            "Family": r["lead"].guardian_name or r["lead"].name, "Children": ", ".join(a.first_name for a, *_ in r["kids"]),
+            "Due": r["due"], "Amount": r["amount"], "Request": r["request"].reference if r["request"] else ""}
+            for r in rows]).to_csv(index=False).encode(), f"upcoming_{d}.csv", "text/csv", icon=":material/download:")
+    for r in rows:
+        lead = r["lead"]
+        key = f"up_{r['key']}"
+        with st.container(border=True):
+            h1, h2 = st.columns([3, 2], vertical_alignment="center")
+            h1.markdown(f"**{lead.guardian_name or lead.name}** · "
+                        + ", ".join(a.first_name for a, *_ in r["kids"])
+                        + ("  " + ui.badge("Overdue", "red") if r["overdue"] else ""))
+            h1.caption(f"Due **{logic.fmt_date(r['due'])}** · expected **{ui.money(r['amount'], cfg)}**")
+            req = r["request"]
+            if req:
+                h2.markdown(f"{ui.badge('Request ' + req.reference, 'blue')} "
+                            + (ui.badge("Pay link ready", "green") if req.pay_url else ui.badge("Manual", "gray")))
+            else:
+                with h2.popover("Create payment request", icon=":material/request_quote:", width="stretch"):
+                    for a, f, item in r["kids"]:
+                        st.number_input(f"{a.first_name}: {item['sessions']} sessions", 0.0, 100000.0,
+                                        float(item["amount"]), step=10.0, key=f"{key}_amt_{a.id}")
+                    st.caption("SkipCash pay link will be created automatically." if gateway.is_configured()
+                               else "Online payments are off: the request is tracked and marked paid by hand.")
+                    st.button("Create request", key=f"{key}_go", type="primary", on_click=_make_request,
+                              args=([a.id for a, *_ in r["kids"]], r["due"], key))
+
+
+def _settle(rid, method):
+    if not ui.is_admin():
+        return
+    with db.session() as s:
+        cfg = db.get_settings(s)
+        req = s.get(PaymentRequest, rid)
+        blocks = logic.settle_request(s, req, logic.today(cfg), method, cfg)
+        auth.audit(s, ui.user().get("name"), "admin", "payreq.paid", req.reference, {"method": method, "blocks": len(blocks)})
+        ref = req.reference
+    st.toast(f"{ref} paid: {len(blocks)} block(s) created.", icon=":material/check_circle:")
+
+
+def _cancel_req(rid):
+    if not ui.is_admin():
+        return
+    with db.session() as s:
+        req = s.get(PaymentRequest, rid)
+        req.status = "cancelled"
+        auth.audit(s, ui.user().get("name"), "admin", "payreq.cancel", req.reference)
+
+
+def _check_online(rid):
+    if not ui.is_admin():
+        return
+    with db.session() as s:
+        cfg = db.get_settings(s)
+        req = s.get(PaymentRequest, rid)
+        try:
+            status = gateway.payment_status(req.provider_id)
+        except Exception as e:
+            st.toast(f"Couldn't reach SkipCash: {e}", icon=":material/error:")
+            return
+        if status == "paid":
+            logic.settle_request(s, req, logic.today(cfg), "SkipCash", cfg)
+            auth.audit(s, "SkipCash", "system", "payreq.paid", req.reference)
+        st.toast(f"{req.reference}: {status}")
+
+
+def _check_all_online():
+    if not ui.is_admin():
+        return
+    with db.session() as s:
+        ids = [r.id for r in s.scalars(select(PaymentRequest).where(
+            PaymentRequest.provider == "skipcash", PaymentRequest.status.in_(["open", "link_sent"])))]
+    for rid in ids:
+        _check_online(rid)
+
+
+def _requests(s, cfg, d):
+    if msg := st.session_state.pop("pay_flash_err", None):
+        st.error(msg)
+    on = gateway.is_configured()
+    st.caption((f":green-badge[SkipCash {gateway.mode()}] Pay links are created automatically." if on else
+                ":gray-badge[Online payments off] Add SkipCash keys to switch on pay links. Until then, mark requests "
+                "paid when cash or a transfer arrives."))
+    show = ui.segmented("Show", ["Open", "Paid", "Cancelled"], default="Open", key="rq_show",
+                        label_visibility="collapsed") or "Open"
+    statuses = {"Open": ["open", "link_sent"], "Paid": ["paid"], "Cancelled": ["cancelled"]}[show]
+    reqs = s.scalars(select(PaymentRequest).where(PaymentRequest.status.in_(statuses))
+                     .order_by(PaymentRequest.due_date, PaymentRequest.created_at)).all()
+    if on and show == "Open" and any(r.provider == "skipcash" for r in reqs):
+        st.button("Check SkipCash for payments", on_click=_check_all_online, icon=":material/sync:")
+    if not reqs:
+        st.caption("No requests here. Create them from **Upcoming**.")
+    for r in reqs:
+        items = json.loads(r.items)
+        names = ", ".join(s.get(Athlete, i["athlete_id"]).first_name for i in items if s.get(Athlete, i["athlete_id"]))
+        with st.container(border=True):
+            c1, c2 = st.columns([3, 2], vertical_alignment="center")
+            c1.markdown(f"**{r.reference}** · {r.payer_name or ''} · {names}  "
+                        + ui.badge(ui.money(r.amount, cfg), "blue"))
+            c1.caption(f"Due {logic.fmt_date(r.due_date)} · created {r.created_at:%d %b} by {r.created_by or '—'}"
+                       + (f" · paid {r.paid_at:%d %b} ({r.paid_method})" if r.paid_at else ""))
+            if r.status in ("open", "link_sent"):
+                if r.pay_url:
+                    c2.link_button("Open pay link", r.pay_url, icon=":material/link:", width="stretch")
+                    c2.button("Check payment", key=f"rqc_{r.id}", on_click=_check_online, args=(r.id,), width="stretch")
+                m1, m2, m3 = c2.columns(3)
+                m1.button("Cash", key=f"rqp_cash_{r.id}", on_click=_settle, args=(r.id, "Cash"), width="stretch",
+                          help="Mark paid in cash and create the blocks")
+                m2.button("Transfer", key=f"rqp_bank_{r.id}", on_click=_settle, args=(r.id, "Bank transfer"),
+                          width="stretch")
+                m3.button("Cancel", key=f"rqx_{r.id}", on_click=_cancel_req, args=(r.id,), width="stretch")
+
+
+IMPORT_FIELDS = {"reference": "Reference / transaction ID", "amount": "Amount", "status": "Status (optional)",
+                 "date": "Date (optional)"}
+
+
+def _apply_import(matches):
+    if not ui.is_admin():
+        return
+    n = 0
+    with db.session() as s:
+        cfg = db.get_settings(s)
+        for rid, pay_date in matches:
+            req = s.get(PaymentRequest, rid)
+            if req and req.status != "paid":
+                logic.settle_request(s, req, pay_date or logic.today(cfg), "SkipCash (import)", cfg)
+                n += 1
+        auth.audit(s, ui.user().get("name"), "admin", "payreq.import", f"{n} paid")
+    st.session_state["import_done"] = n
+
+
+def _import(s, cfg, d):
+    st.markdown("Upload a payments export (SkipCash portal, bank statement…) as **CSV or Excel**. Rows whose "
+                "reference matches an open request (e.g. `TNT-7KQ2MX`) are marked paid and their blocks created.")
+    if (n := st.session_state.pop("import_done", None)) is not None:
+        st.success(f"{n} request(s) marked paid.", icon=":material/check_circle:")
+    up = st.file_uploader("Payments file", type=["csv", "xlsx"], key="imp_file")
+    if not up:
+        return
+    try:
+        df = pd.read_csv(up) if up.name.lower().endswith(".csv") else pd.read_excel(up)
+    except Exception as e:
+        st.error(f"Couldn't read that file: {e}")
+        return
+    st.caption(f"{len(df)} rows · columns: {', '.join(map(str, df.columns))}")
+    cols = ["—"] + list(map(str, df.columns))
+    guess = lambda *words: next((i for i, c in enumerate(cols) if any(w in c.lower() for w in words)), 0)  # noqa: E731
+    c = st.columns(4)
+    pick = {k: c[i].selectbox(label, cols, index=guess(*{"reference": ["ref", "transaction", "custom", "order"],
+                                                          "amount": ["amount", "total"], "status": ["status"],
+                                                          "date": ["date", "time"]}[k]), key=f"imp_{k}")
+            for i, (k, label) in enumerate(IMPORT_FIELDS.items())}
+    if pick["reference"] == "—":
+        st.info("Pick the column that holds the reference.")
+        return
+    open_reqs = {r.reference.upper(): r for r in s.scalars(select(PaymentRequest).where(
+        PaymentRequest.status.in_(["open", "link_sent"])))}
+    matches, rows = [], []
+    for _, row in df.iterrows():
+        text = " ".join(str(row[x]) for x in [pick["reference"]] if x != "—").upper()
+        ref = next((k for k in open_reqs if k in text), None)
+        ok_status = pick["status"] == "—" or str(row[pick["status"]]).strip().lower() in (
+            "paid", "success", "successful", "completed", "captured", "2", "approved")
+        amt = pd.to_numeric(row[pick["amount"]], errors="coerce") if pick["amount"] != "—" else None
+        req = open_reqs.get(ref) if ref else None
+        amount_ok = req is None or amt is None or pd.isna(amt) or abs(float(amt) - req.amount) < 0.01
+        pay_date = pd.to_datetime(row[pick["date"]], errors="coerce", dayfirst=True).date() \
+            if pick["date"] != "—" and not pd.isna(pd.to_datetime(row[pick["date"]], errors="coerce", dayfirst=True)) else None
+        verdict = ("Will mark paid" if req and ok_status and amount_ok else
+                   "Amount differs: check" if req and not amount_ok else
+                   "Not paid status" if req else "No matching request")
+        rows.append({"Reference": text[:40], "Matched": req.reference if req else "", "Amount": amt,
+                     "Expected": req.amount if req else None, "Result": verdict})
+        if verdict == "Will mark paid":
+            matches.append((req.id, pay_date))
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    st.button(f"Mark {len(matches)} request(s) paid", type="primary", disabled=not matches,
+              on_click=_apply_import, args=(matches,), icon=":material/done_all:")
 
 
 # --------------------------------------------------------------------------- history

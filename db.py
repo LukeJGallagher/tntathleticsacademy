@@ -165,6 +165,33 @@ class PaymentBlock(Base):
     athlete: Mapped[Athlete] = relationship(back_populates="blocks")
 
 
+class PaymentRequest(Base):
+    """A payment the academy is expecting: one per family (or athlete) per renewal.
+    items = JSON list of {athlete_id, sessions, per_week, amount}. When paid, each item becomes a PaymentBlock.
+    provider 'manual' = cash/transfer marked by admin; 'skipcash' = online pay link."""
+    __tablename__ = "payment_requests"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    reference: Mapped[str] = mapped_column(String(20), unique=True)  # e.g. TNT-7KQ2MX, also sent to the gateway
+    family_code: Mapped[str | None] = mapped_column(String(12), index=True)
+    payer_name: Mapped[str | None] = mapped_column(String(120))
+    payer_phone: Mapped[str | None] = mapped_column(String(40))
+    payer_email: Mapped[str | None] = mapped_column(String(120))
+    items: Mapped[str] = mapped_column(Text)
+    amount: Mapped[float] = mapped_column(Float, default=0)
+    currency: Mapped[str] = mapped_column(String(3), default="QAR")
+    due_date: Mapped[date | None] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(String(12), default="open")  # open | link_sent | paid | cancelled
+    provider: Mapped[str] = mapped_column(String(12), default="manual")
+    provider_id: Mapped[str | None] = mapped_column(String(80))
+    pay_url: Mapped[str | None] = mapped_column(String(500))
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime)
+    paid_method: Mapped[str | None] = mapped_column(String(30))
+    family_ref: Mapped[str | None] = mapped_column(String(20))  # links to the PaymentBlocks created
+    created_by: Mapped[str | None] = mapped_column(String(100))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    is_sample: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class HealthEvent(Base):
     __tablename__ = "health_events"
     id: Mapped[int] = mapped_column(primary_key=True)

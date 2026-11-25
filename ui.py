@@ -116,11 +116,31 @@ def page_header(title: str, subtitle: str | None = None, cfg: dict | None = None
         st.caption(subtitle)
 
 
+TEST_MODE = os.environ.get("ROLLCALL_TEST") == "1"
+
+
+def segmented(label, options, **kw):
+    """st.segmented_control in the app; st.radio under the automated test harness, which can't drive
+    segmented controls. Same key, value and callbacks either way."""
+    if not TEST_MODE:
+        return st.segmented_control(label, options, **kw)
+    kw.pop("width", None)
+    kw.pop("selection_mode", None)
+    default = kw.pop("default", None)
+    key = kw.get("key")
+    opts = list(options)
+    if key and key in st.session_state:
+        index = opts.index(st.session_state[key]) if st.session_state[key] in opts else None
+    else:
+        index = opts.index(default) if default in opts else None
+    return st.radio(label, opts, index=index, **kw)
+
+
 def tabs(options: list[str], key: str) -> str:
     """Tab bar that survives reruns (st.tabs jumps back to the first tab after a form submit)."""
     if st.session_state.get(key) not in options:
         st.session_state[key] = options[0]
-    choice = st.segmented_control("Section", options, key=key, label_visibility="collapsed")
+    choice = segmented("Section", options, key=key, label_visibility="collapsed")
     if choice is None:  # clicking the active segment deselects it; keep the last one
         choice = st.session_state.get(f"_{key}_last", options[0])
     st.session_state[f"_{key}_last"] = choice

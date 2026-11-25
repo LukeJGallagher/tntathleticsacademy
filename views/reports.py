@@ -37,7 +37,8 @@ def render():
                   "This month": (month0, d), "Last month": (last_month_end.replace(day=1), last_month_end),
                   "Custom": None}
         c1, c2 = st.columns([3, 2], vertical_alignment="bottom")
-        pick = c1.segmented_control("Period", list(ranges), default="This month", key="rp_period") or "This month"
+        with c1:
+            pick = ui.segmented("Period", list(ranges), default="This month", key="rp_period") or "This month"
         if pick == "Custom":
             rng = c2.date_input("Range", (d - timedelta(days=30), d), format="DD/MM/YYYY", key="rp_range")
             if len(rng) != 2:

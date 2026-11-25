@@ -1,6 +1,7 @@
 """Business rules: scoping, rosters, bookings/waitlist, attendance, health, fees, reminders, reports."""
 from __future__ import annotations
 
+import json
 import math
 import re
 import secrets
@@ -662,6 +663,79 @@ def contact_links(a: Athlete, msg: str, cfg: dict) -> dict[str, str]:
     if a.email:
         out["Email"] = f"mailto:{a.email}?subject={quote(cfg['club_name'] + ' – payment reminder')}&body={quote(msg)}"
     return out
+
+
+# --------------------------------------------------------------------------- payment requests
+
+def expected_item(a: Athlete, cfg: dict) -> dict:
+    """What this athlete's next block will most likely be: same as their last block, else the defaults."""
+    last = max(a.blocks, key=lambda b: (b.start_date, b.id or 0)) if a.blocks else None
+    per_week = max(1, len([x for x in a.sessions if x.active]) or cfg_int(cfg, "default_per_week", 2))
+    return {"athlete_id": a.id,
+            "sessions": last.sessions_purchased if last else cfg_int(cfg, "default_sessions", 8),
+            "per_week": last.sessions_per_week if last else per_week,
+            "amount": float(last.amount if last and last.amount else cfg.get("default_amount") or 0)}
+
+
+def open_request(s, family_code: str | None, athlete_id: int | None = None):
+    from db import PaymentRequest
+    q = select(PaymentRequest).where(PaymentRequest.status.in_(["open", "link_sent"]))
+    if family_code:
+        q = q.where(PaymentRequest.family_code == family_code)
+    rows = s.scalars(q.order_by(PaymentRequest.created_at.desc())).all()
+    if athlete_id is not None:
+        rows = [r for r in rows if athlete_id in {i["athlete_id"] for i in json.loads(r.items)}]
+    return rows[0] if rows else None
+
+
+def upcoming(s, athletes: list[Athlete], d: date, cfg: dict, days: int) -> list[dict]:
+    """Families with a payment due within `days` (or overdue), with the expected amount per child."""
+    fams: dict[str, list] = {}
+    for a in athletes:
+        f = athlete_finance(s, a, d, cfg)
+        due = f["next_due"]
+        if f["status"] == "none" or due is None or due > d + timedelta(days=days):
+            continue
+        fams.setdefault(family_key(a), []).append((a, f, expected_item(a, cfg)))
+    out = []
+    for key, kids in fams.items():
+        lead = kids[0][0]
+        due = min(f["next_due"] for _, f, _ in kids)
+        out.append({"key": key, "family_code": lead.family_code, "lead": lead, "kids": kids, "due": due,
+                    "overdue": due < d, "amount": sum(i["amount"] for *_, i in kids),
+                    "request": open_request(s, lead.family_code, None if lead.family_code else lead.id)})
+    return sorted(out, key=lambda r: r["due"])
+
+
+def create_request(s, kids: list[tuple[Athlete, dict]], due: date | None, cfg: dict, by: str):
+    """kids = [(athlete, item)]. Returns the PaymentRequest."""
+    from db import PaymentRequest
+    lead = kids[0][0]
+    ref = "TNT-" + "".join(secrets.choice(_CODE_CHARS) for _ in range(6))
+    req = PaymentRequest(reference=ref, family_code=lead.family_code, payer_name=lead.guardian_name or lead.name,
+                         payer_phone=lead.phone, payer_email=lead.email,
+                         items=json.dumps([i for _, i in kids]), amount=sum(i["amount"] for _, i in kids),
+                         currency=(cfg.get("currency") or "QAR")[:3], due_date=due, created_by=by, status="open")
+    s.add(req)
+    s.flush()
+    return req
+
+
+def settle_request(s, req, pay_date: date, method: str, cfg: dict, stack: bool = True) -> list[PaymentBlock]:
+    """Mark a request paid: every child gets their block (sharing one family reference)."""
+    if req.status == "paid":
+        return []
+    items = json.loads(req.items)
+    if len(items) > 1:
+        ref, blocks = record_family_payment(s, items, pay_date, method, stack, cfg, notes=f"Request {req.reference}")
+    else:
+        it = items[0]
+        ref = req.reference
+        blocks = [record_payment(s, it["athlete_id"], pay_date, it["sessions"], it["per_week"], it["amount"],
+                                 method, stack, cfg, notes=f"Request {req.reference}", family_ref=ref)]
+    req.status, req.paid_at, req.paid_method, req.family_ref = "paid", utcnow(), method, ref
+    s.flush()
+    return blocks
 
 
 # --------------------------------------------------------------------------- follow-up

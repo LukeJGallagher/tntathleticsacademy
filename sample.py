@@ -1,6 +1,7 @@
 """Fictional demo data for an athletics academy. Every row is flagged is_sample=True."""
 from __future__ import annotations
 
+import json
 import random
 from datetime import date, datetime, timedelta
 
@@ -8,7 +9,7 @@ from sqlalchemy import delete, select
 
 import auth
 import logic
-from db import (Athlete, Attendance, AuditLog, Booking, Coach, HealthEvent, PaymentBlock, Reminder,
+from db import (Athlete, Attendance, AuditLog, Booking, Coach, HealthEvent, PaymentBlock, PaymentRequest, Reminder,
                 TrainingSession, User, session_athletes, utcnow)
 
 DEMO_PASSWORD = "demo1234"
@@ -51,7 +52,7 @@ def has_sample(s) -> bool:
 def remove_sample(s, keep_logins: bool = False) -> None:
     sample_sessions = select(TrainingSession.id).where(TrainingSession.is_sample.is_(True))
     sample_athletes = select(Athlete.id).where(Athlete.is_sample.is_(True))
-    for model in (Attendance, Booking, Reminder, HealthEvent, PaymentBlock):
+    for model in (Attendance, Booking, Reminder, HealthEvent, PaymentBlock, PaymentRequest):
         s.execute(delete(model).where(model.is_sample.is_(True)))
     s.execute(delete(session_athletes).where(session_athletes.c.session_id.in_(sample_sessions)))
     s.execute(delete(session_athletes).where(session_athletes.c.athlete_id.in_(sample_athletes)))
@@ -204,4 +205,15 @@ def load_sample(s, cfg: dict) -> None:
                       created_at=utcnow() + timedelta(seconds=k), is_sample=True))
     s.add(Reminder(athlete_id=athletes[1].id, sent_on=utcnow() - timedelta(days=1), due_date=today + timedelta(days=3),
                    channel="WhatsApp", message="Renewal reminder", sent_by="Academy Admin", is_sample=True))
+    s.flush()
+
+    # Two open payment requests (one family, one single) so Requests / Import have something to show
+    s.refresh(athletes[0])
+    fam = [a for a in athletes if a.family_code == athletes[0].family_code]
+    for kids, ref in ((fam, "TNT-DEMO01"), ([athletes[12]], "TNT-DEMO02")):
+        items = [logic.expected_item(a, cfg) for a in kids]
+        s.add(PaymentRequest(reference=ref, family_code=kids[0].family_code, payer_name=kids[0].guardian_name,
+                             payer_phone=kids[0].phone, payer_email=kids[0].email, items=json.dumps(items),
+                             amount=sum(i["amount"] for i in items), currency=cfg.get("currency", "QAR")[:3],
+                             due_date=today + timedelta(days=3), created_by="Academy Admin", is_sample=True))
     s.flush()

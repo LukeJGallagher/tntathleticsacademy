@@ -160,6 +160,20 @@ with db.session() as s:
     print(f"ok   payment stacks: next due {before} → {after}")
     assert after is None or before is None or after > before
 
+# 6b. Payment requests: upcoming forecast → request → paid creates one block per child
+with db.session() as s:
+    cfg = db.get_settings(s)
+    d = logic.today(cfg)
+    ups = logic.upcoming(s, logic.list_athletes(s, ADMIN, cfg), d, cfg, 30)
+    fam = next(r for r in ups if len(r["kids"]) > 1 and not r["request"])
+    req = logic.create_request(s, [(a, i) for a, _, i in fam["kids"]], fam["due"], cfg, "test")
+    before = {a.id: len(a.blocks) for a, *_ in fam["kids"]}
+    blocks = logic.settle_request(s, req, d, "Cash", cfg)
+    assert req.status == "paid" and len(blocks) == len(fam["kids"])
+    assert all(len(s.get(db.Athlete, aid).blocks) == n + 1 for aid, n in before.items())
+    assert logic.settle_request(s, req, d, "Cash", cfg) == []  # idempotent
+    print(f"ok   payment request {req.reference}: {len(blocks)} blocks, {len(ups)} families upcoming")
+
 # 7. Regression tests for the Nov 2026 code audit
 import auth  # noqa: E402
 import backup  # noqa: E402

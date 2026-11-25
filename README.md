@@ -53,6 +53,23 @@ Tables are created automatically. Daily backups are included on paid plans; othe
 
 Then set **Settings → Club → App web address** so the family-code WhatsApp message includes the booking link.
 
+## Payments workflow
+
+1. **Payments → Upcoming**: everyone due in the next 30/60/90 days, expected income per week (from each
+   athlete's last block), CSV export.
+2. **Create payment request** per family: one reference (e.g. `TNT-7KQ2MX`) covering all children.
+   Reminders automatically include the reference, or the online pay link when SkipCash is on.
+3. **Payments → Requests**: mark paid as Cash / Transfer, which creates every child's block in one go.
+   With SkipCash on: *Check payment* (or *Check SkipCash for payments*) settles paid links automatically.
+4. **Payments → Import**: upload a SkipCash or bank CSV/Excel export, map the columns once; rows whose
+   reference matches an open request (and amount matches) are marked paid.
+
+**Switching on SkipCash**: add `SKIPCASH_ENV`, `SKIPCASH_CLIENT_ID`, `SKIPCASH_KEY_ID`, `SKIPCASH_KEY_SECRET`
+to secrets (see `secrets.toml.example`). `gateway.py` holds the whole integration and is **untested against a
+real SkipCash account**: verify the endpoints, signing and status codes with sandbox keys before going live.
+Instant confirmation via webhook needs a small receiver outside Streamlit (Supabase Edge Function or a VPS
+endpoint); until then use *Check payment* or Import.
+
 ## Backups
 
 - **In the app:** Settings → Backup → download a ZIP of every table; restore replaces everything (one transaction).

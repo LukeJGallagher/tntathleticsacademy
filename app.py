@@ -8,9 +8,22 @@ Roles
 Navigation: every page URL is always registered, so links, refreshes and sign-in/out never hit
 "page not found". Each page checks the role itself; the sidebar menu only lists what the role can open.
 """
+import os
+import sys
+import time
+
 import streamlit as st
 
-import auth
+_T0 = time.time()
+_TIMING = os.environ.get("ROLLCALL_TIMING") == "1"
+
+
+def _tick(label):
+    if _TIMING:
+        print(f"[timing] {time.time() - _T0:6.2f}s {label}", file=sys.stderr, flush=True)
+
+
+import auth  # noqa: E402
 import db
 import sample
 import ui
@@ -27,10 +40,10 @@ with db.session() as s:
 from views import (athletes, attendance, book, bookings, health, home, overview, payments, reports,  # noqa: E402
                    schedule, settings)
 
-if ui.flush_cookie():  # just signed in: cookie written, page reloads on the same URL
-    st.caption("Signing you in…")
-    st.stop()
+_tick("setup + seed check")
 user = ui.current_user()
+cookie_written = ui.flush_cookie()  # after current_user: an expired session queues a cookie clear
+_tick(f"current_user -> {user and user['username']}")
 role = user["role"] if user else ("parent" if st.session_state.get("parent_code") else None)
 
 ADMIN, COACH, PARENT = {"admin"}, {"admin", "coach"}, {"parent"}
@@ -68,6 +81,11 @@ def guarded(key, fn, roles):
 def home_page():
     if role is None:
         home.render()
+    elif cookie_written:
+        # Just signed in on "/": show the start page right here. Navigating away in this same run could
+        # cancel the cookie script; the next click or refresh moves on normally.
+        start = {"admin": overview.render, "coach": attendance.render, "parent": book.render}[role]
+        start()
     else:
         st.switch_page(pages[HOME_FOR[role]])
 
@@ -100,4 +118,6 @@ if user:
         if ui.demo_mode():
             st.caption(":material/science: Demo mode: fictional data")
 
+_tick(f"nav built, running page {nav.url_path or 'home'}")
 nav.run()
+_tick("page done")

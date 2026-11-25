@@ -214,18 +214,19 @@ def _is_https() -> bool:
 
 
 def flush_cookie() -> bool:
-    """Write or clear the session cookie in the browser. Call once per run, early. When a new session
-    cookie is written the page reloads itself, so the cookie is guaranteed to land before any navigation.
-    Returns True when a reload is pending (caller should st.stop())."""
+    """Write or clear the session cookie in the browser. Call once per run, early.
+    Sign-in never depends on the cookie: the signed-in state lives in this browser session already, and the
+    cookie only restores it after a refresh. So there is no reload; if a browser blocks the cookie, the
+    worst case is signing in again after a refresh. Returns True when a cookie was written this run
+    (the caller must not navigate away in the same run, or the cookie script may not get to run)."""
     pending = st.session_state.pop("_cookie", None)
     if pending is None:
         return False
     token, max_age = pending
     secure = "; Secure" if _is_https() else ""
-    reload = "window.parent.location.reload();" if token else ""
     components.html(
         f"<script>window.parent.document.cookie = '{COOKIE}={token}; Max-Age={max_age}; Path=/; SameSite=Lax{secure}';"
-        f"{reload}</script>", height=0)
+        f"</script>", height=0)
     return bool(token)
 
 

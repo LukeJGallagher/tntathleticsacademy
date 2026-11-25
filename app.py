@@ -32,6 +32,17 @@ st.set_page_config(page_title="TNT Athletics Academy", page_icon="assets/icon.pn
                    initial_sidebar_state="auto")
 ui.inject_css()
 
+# Connect (creates tables on first run). A bad DATABASE_URL shows a plain fix, not a stack trace.
+try:
+    db.get_engine()
+except db.DatabaseUnavailable as e:
+    print(f"[rollcall] database connection failed: {e.__cause__!r}", file=sys.stderr, flush=True)
+    ui.hero("TNT Athletics Academy", "We'll be right back")
+    st.error("The app can't reach its database right now.", icon=":material/cloud_off:")
+    st.info(f"**For the admin:** {e}", icon=":material/build:")
+    st.caption("After fixing the secret, reboot the app (Manage app → ⋮ → Reboot app). Full details are in the app log.")
+    st.stop()
+
 # First run in demo mode: fill the database with fictional sample data
 with db.session() as s:
     if ui.demo_mode() and auth.user_count(s) == 0 and not sample.has_sample(s):

@@ -298,6 +298,34 @@ _engine = None
 _Session = None
 
 
+class DatabaseUnavailable(RuntimeError):
+    """Raised when the database can't be reached. The message is safe to show (no password)."""
+
+
+def explain_connection_error(e: Exception, url: str) -> str:
+    """Turn a driver error into a plain-English fix. Never includes the password."""
+    msg = str(getattr(e, "orig", e)).lower()
+    host = url.split("@")[-1].split("/")[0] if "@" in url else "?"
+    user = url.split("://", 1)[-1].split(":", 1)[0] if "://" in url else "?"
+    if "password authentication failed" in msg:
+        return ("The database password in DATABASE_URL is wrong. Paste the password again (no [ ] brackets). "
+                "If it contains @ # / ? % or :, reset it in Supabase to letters and numbers only.")
+    if "tenant or user not found" in msg or "no such user" in msg:
+        return (f"The database username '{user}' isn't recognised. For Supabase's pooler it must be "
+                "'postgres.<project-id>' (e.g. postgres.amkbd…).")
+    if any(k in msg for k in ("could not translate host name", "network is unreachable", "timeout",
+                              "timed out", "name or service not known", "connection refused")):
+        hint = (" This is the Direct connection address, which Streamlit Cloud can't reach: use the "
+                "Session pooler URI (…pooler.supabase.com:5432) from Supabase → Connect → Connection String."
+                if host.startswith("db.") else "")
+        return f"Can't reach the database server at {host}.{hint}"
+    if "no module named" in msg:
+        return f"The database driver isn't installed ({msg}). Check requirements.txt and redeploy."
+    if "ssl" in msg:
+        return f"The database at {host} refused the secure connection. Check you copied the Session pooler URI."
+    return f"Can't connect to the database at {host}. Check DATABASE_URL in the app's secrets."
+
+
 def get_engine():
     global _engine, _Session
     with _lock:
@@ -307,10 +335,18 @@ def get_engine():
             if url.startswith("sqlite"):
                 kw["connect_args"] = {"check_same_thread": False}
             else:
-                kw.update(pool_pre_ping=True, pool_recycle=280)
-            eng = create_engine(url, **kw)
-            Base.metadata.create_all(eng)
-            _migrate(eng)
+                kw.update(pool_pre_ping=True, pool_recycle=280, pool_size=5, max_overflow=5)
+                if url.startswith("postgresql"):
+                    kw["connect_args"] = {"connect_timeout": 10, "sslmode": "require"}
+            eng = None
+            try:
+                eng = create_engine(url, **kw)
+                Base.metadata.create_all(eng)
+                _migrate(eng)
+            except Exception as e:
+                if eng is not None:
+                    eng.dispose()
+                raise DatabaseUnavailable(explain_connection_error(e, url)) from e
             _Session = sessionmaker(eng, expire_on_commit=False)
             _engine = eng
     return _engine
